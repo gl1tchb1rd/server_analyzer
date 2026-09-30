@@ -1,0 +1,48 @@
+# Lokale Laufzeitumgebung
+_runtime/
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Ermittlungs-/Testdaten niemals versehentlich veröffentlichen
+cases/
+evidence/
+testdata/
+_testdata/
+reports/
+output/
+exports/
+*.E01
+*.Ex01
+*.raw
+*.dd
+*.img
+*.journal
+*.journal~
+*.pcap
+*.pcapng
+
+# Lokale Offline-Abhängigkeiten nicht standardmäßig ins Repository
+_system/wheels/*.whl
+
+# Build-Ausgaben
+build/
+dist/
+*.spec
+
+# Lokale Test-/Coverage-Ausgaben
+.coverage
+htmlcov/
