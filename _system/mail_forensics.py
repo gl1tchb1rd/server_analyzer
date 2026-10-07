@@ -1,435 +1,1219 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Gl1tchb1rd
-
 from __future__ import annotations
 
+import gzip
+import glob
+import ipaddress
+import os
 import re
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
-from server_forensics import DOMAIN_RE, linux_to_host, rel_source, resolve_evidence_path, safe_read_text
+MAX_CONFIG_FILE = 8 * 1024 * 1024
+MAX_MAIL_LOG_FILES = 120
+MAX_MAIL_LOG_LINES = 2_000_000
+MAX_MAIL_ACCOUNTS = 100_000
+MAX_MAIL_ALIASES = 100_000
+MAX_MAIL_ACCESSES = 200_000
 
-EMAIL_RE = re.compile(r"(?i)(?<![\w.+-])([a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![\w.-])")
-
-
-@dataclass(slots=True)
-class MailAccount:
-    address: str
-    assessment: str
-    evidence: list[str]
-    mailbox_path: str = ""
-    forwarding: list[str] | None = None
-    source: list[str] | None = None
-
-
-@dataclass(slots=True)
-class MailAccess:
-    timestamp: str
-    protocol: str
-    user: str
-    ip: str
-    result: str
-    source: str
-    ssh_correlated: bool = False
+EMAIL_RE = re.compile(r"(?i)(?<![A-Z0-9._%+\-])([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,63})(?![A-Z0-9._%+\-])")
+MAP_SPEC_RE = re.compile(r"(?i)\b(?:hash|btree|lmdb|texthash|regexp|pcre):(/[^\s,]+)")
+ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(/(?:etc|var|opt|usr|home|srv)/[^\s,;{}]+)")
+DOVECOT_LOGIN_RE = re.compile(
+    r"(?i)(?:imap|pop3|submission)(?:-login)?:.*?Login:\s*user=<(?P<user>[^>]+)>.*?rip=(?P<ip>[^,\s]+)"
+)
+POSTFIX_SASL_RE = re.compile(
+    r"(?i)postfix/(?:smtpd|submission/smtpd).*?client=.*?\[(?P<ip>[0-9a-f:.]+)\].*?sasl_username=(?P<user>[^,\s]+)"
+)
+EXIM_AUTH_RE = re.compile(
+    r"(?i)(?:dovecot_login|plain|login).*?auth(?:enticated)?(?:_id| as)?[=: ]+(?P<user>[^\s,]+).*?(?:H=|\[)(?P<ip>[0-9a-f:.]+)"
+)
 
 
-def _valid_email(value: str) -> str | None:
-    m = EMAIL_RE.fullmatch(value.strip().strip("<>,;\"'"))
-    return m.group(1).lower() if m else None
+@dataclass
+class MailScanResult:
+    servers: list[dict[str, Any]] = field(default_factory=list)
+    accounts: list[dict[str, Any]] = field(default_factory=list)
+    aliases: list[dict[str, Any]] = field(default_factory=list)
+    accesses: list[dict[str, Any]] = field(default_factory=list)
+    log_files: list[str] = field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
-def _add_account(accounts: dict[str, dict], address: str, evidence: str, source: str = "", mailbox_path: str = "", forwarding: list[str] | None = None, strong: bool = False) -> None:
-    addr = _valid_email(address)
-    if not addr:
-        return
-    row = accounts.setdefault(addr, {"address": addr, "evidence": [], "sources": [], "mailbox_path": "", "forwarding": [], "strong": False})
-    if evidence and evidence not in row["evidence"]:
-        row["evidence"].append(evidence)
-    if source and source not in row["sources"]:
-        row["sources"].append(source)
-    if mailbox_path:
-        row["mailbox_path"] = mailbox_path
-    if forwarding:
-        for f in forwarding:
-            e = _valid_email(f)
-            if e and e not in row["forwarding"]:
-                row["forwarding"].append(e)
-    row["strong"] = row["strong"] or strong
-
-
-def _parse_psa_conf(root: Path) -> tuple[Path | None, dict]:
-    path = root / "etc/psa/psa.conf"
-    diag = {"plesk_detected": path.is_file(), "plesk_mailnames_d": "", "plesk_mailstorage_method": "", "plesk_domains": 0, "plesk_accounts": 0, "plesk_unreadable": 0}
-    if not path.is_file():
-        return None, diag
-    text = safe_read_text(path)
-    m = re.search(r"(?im)^\s*PLESK_MAILNAMES_D\s+(.+?)\s*$", text)
-    linux_path = m.group(1).strip().strip('"\'') if m else "/var/qmail/mailnames"
-    diag["plesk_mailnames_d"] = linux_path
-    host = linux_to_host(root, linux_path)
-    resolved, method = resolve_evidence_path(root, host)
-    diag["plesk_mailstorage_method"] = method
-    return resolved, diag
-
-
-def _plesk_accounts(root: Path, accounts: dict[str, dict], diag: dict) -> None:
-    storage, diag_update = _parse_psa_conf(root)
-    diag.update(diag_update)
-    if storage is None or not storage.exists():
-        return
+def _safe_rel(root: Path, path: Path) -> str:
     try:
-        domains = [p for p in storage.iterdir() if p.is_dir() and DOMAIN_RE.fullmatch(p.name)]
+        return "/" + path.relative_to(root).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _read_text(path: Path, limit: int = MAX_CONFIG_FILE) -> str:
+    try:
+        if not path.is_file() or path.stat().st_size > limit:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return
-    diag["plesk_domains"] = len(domains)
-    count = 0
-    for domain_dir in domains:
+        return ""
+
+
+def _root_path(root: Path, linux_path: str) -> Path:
+    value = linux_path.strip().strip('"\'')
+    if value.startswith("/"):
+        value = value[1:]
+    return root / value
+
+
+def _rooted_symlink_target(root: Path, path: Path, max_depth: int = 8) -> Path:
+    """Resolve Linux-style absolute symlinks inside a mounted/extracted root.
+
+    An absolute target such as /var/qmail/mailnames must be interpreted relative to
+    the evidence root rather than the Windows host root.
+    """
+    current = path
+    seen: set[str] = set()
+    for _ in range(max_depth):
+        key = str(current)
+        if key in seen:
+            break
+        seen.add(key)
         try:
-            users = list(domain_dir.iterdir())
+            if not current.is_symlink():
+                return current
+            target = os.readlink(current)
         except OSError:
-            diag["plesk_unreadable"] += 1
-            continue
-        for user_dir in users:
-            if not user_dir.is_dir():
-                continue
-            address = f"{user_dir.name}@{domain_dir.name}"
-            mailbox = ""
-            strong = False
-            for candidate in (user_dir / "Maildir", user_dir / "maildir", user_dir):
-                try:
-                    if candidate.is_dir() and any((candidate / x).is_dir() for x in ("cur", "new", "tmp")):
-                        mailbox = rel_source(root, candidate)
-                        strong = True
-                        break
-                except OSError:
-                    pass
-            forwards: list[str] = []
-            qmail = user_dir / ".qmail"
-            if qmail.is_file():
-                for line in safe_read_text(qmail).splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if line.startswith("&"):
-                        line = line[1:].strip()
-                    forwards.extend(EMAIL_RE.findall(line))
-            _add_account(accounts, address, "Plesk Mailstorage", rel_source(root, user_dir), mailbox, forwards, strong=strong)
-            count += 1
-    diag["plesk_accounts"] = count
-
-
-def _postfix_main(root: Path) -> tuple[dict[str, str], Path | None]:
-    path = root / "etc/postfix/main.cf"
-    if not path.is_file():
-        return {}, None
-    text = safe_read_text(path)
-    merged: list[str] = []
-    for line in text.splitlines():
-        if line[:1].isspace() and merged:
-            merged[-1] += " " + line.strip()
+            return current
+        target_text = str(target).replace("\\", "/")
+        if target_text.startswith("/"):
+            current = root / target_text.lstrip("/")
         else:
-            merged.append(line)
-    conf: dict[str, str] = {}
-    for line in merged:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        conf[key.strip()] = value.strip()
-    return conf, path
+            current = Path(os.path.normpath(str(current.parent / target_text)))
+    return current
 
 
-def _postfix_map_paths(root: Path, spec: str, base: Path) -> tuple[list[Path], list[str]]:
-    paths: list[Path] = []
-    non_file: list[str] = []
-    for token in re.split(r"[\s,]+", spec):
-        token = token.strip()
-        if not token:
-            continue
-        if ":" in token:
-            kind, value = token.split(":", 1)
-            if kind.lower() in {"hash", "btree", "texthash", "lmdb", "cdb"}:
-                paths.append(linux_to_host(root, value, base))
-            elif kind.lower() in {"mysql", "pgsql", "ldap", "sqlite", "proxy"}:
-                non_file.append(token)
-            else:
-                if value.startswith("/"):
-                    paths.append(linux_to_host(root, value, base))
-        elif token.startswith("/"):
-            paths.append(linux_to_host(root, token, base))
-    return paths, non_file
+def _plaintext_link_target(root: Path, path: Path) -> Path | None:
+    """Resolve a symlink that a forensic export exposed as a tiny text file."""
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        if size <= 0 or size > 4096:
+            return None
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        text = raw.decode("utf-8", errors="strict").strip().strip("\x00")
+    except UnicodeDecodeError:
+        return None
+    if not text or "\n" in text or "\r" in text or any(ch in text for ch in "{};"):
+        return None
+    if not text.startswith(("/", "../", "./")):
+        return None
+    if text.startswith("/"):
+        candidate = root / text.lstrip("/")
+    else:
+        candidate = Path(os.path.normpath(str(path.parent / text)))
+    try:
+        if candidate.exists():
+            return candidate
+    except OSError:
+        pass
+    return None
 
 
-def _parse_map_file(root: Path, path: Path, accounts: dict[str, dict], evidence: str) -> int:
-    resolved, _ = resolve_evidence_path(root, path)
-    if not resolved.is_file():
-        return 0
-    count = 0
-    for line in safe_read_text(resolved, 16 * 1024 * 1024).splitlines():
-        line = line.strip()
+def _resolve_evidence_path(root: Path, path: Path) -> tuple[Path | None, str]:
+    """Best-effort resolution for Linux paths exposed through a Windows mount."""
+    try:
+        if path.is_symlink():
+            actual = _rooted_symlink_target(root, path)
+            if actual.exists():
+                return actual, "Linux-Symlink"
+    except OSError:
+        pass
+    surrogate = _plaintext_link_target(root, path)
+    if surrogate is not None:
+        return surrogate, "Symlink-Ziel als Textdatei"
+    try:
+        if path.exists():
+            return path, "direkt lesbar"
+    except OSError:
+        pass
+    return None, "nicht lesbar"
+
+
+def _iter_entries(path: Path) -> list[Path]:
+    """Enumerate directory entries without requiring Path.is_file/is_dir first."""
+    rows: list[Path] = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name not in {".", ".."}:
+                    rows.append(Path(entry.path))
+    except OSError:
+        pass
+    return rows
+
+
+def _directory_accessible(path: Path) -> bool:
+    try:
+        with os.scandir(path):
+            return True
+    except OSError:
+        return False
+
+
+def _resolve_directory(root: Path, path: Path) -> tuple[Path | None, str]:
+    actual, method = _resolve_evidence_path(root, path)
+    if actual is not None:
+        try:
+            if actual.is_dir():
+                return actual, method
+        except OSError:
+            pass
+        if _directory_accessible(actual):
+            return actual, method + " / Verzeichniszugriff"
+    # Some forensic filesystem drivers expose a directory through enumeration even
+    # though stat()/exists() fails. Try direct directory access as a final fallback.
+    if _directory_accessible(path):
+        return path, "direkt per Verzeichniszugriff"
+    return None, "nicht lesbar"
+
+
+def _read_text_evidence(root: Path, path: Path, limit: int = MAX_CONFIG_FILE) -> tuple[str, Path | None, str]:
+    actual, method = _resolve_evidence_path(root, path)
+    if actual is None:
+        return "", None, method
+    return _read_text(actual, limit), actual, method
+
+
+def _valid_ip(value: str) -> str:
+    value = value.strip("[](),;<>\"'")
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return ""
+
+
+def _uncomment_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = re.split(r"\s+", line, maxsplit=1)
-        left = _valid_email(parts[0])
-        if not left:
+        # Common Postfix continuation: indented line continues previous value.
+        if raw[:1].isspace() and pending:
+            pending += " " + line
             continue
-        right = parts[1] if len(parts) > 1 else ""
-        forwards = EMAIL_RE.findall(right)
-        _add_account(accounts, left, evidence, rel_source(root, resolved), forwarding=forwards, strong=False)
-        count += 1
+        if pending:
+            lines.append(pending)
+        pending = line
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+def _postfix_kv(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in _uncomment_lines(text):
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().casefold()
+        if key:
+            out[key] = value.strip()
+    return out
+
+
+def _tokens(value: str) -> list[str]:
+    return [x.strip().strip(",") for x in re.split(r"[\s,]+", value or "") if x.strip().strip(",")]
+
+
+def _expand_postfix_token(token: str, kv: dict[str, str]) -> str:
+    replacements = {
+        "$myhostname": kv.get("myhostname", ""),
+        "${myhostname}": kv.get("myhostname", ""),
+        "$mydomain": kv.get("mydomain", ""),
+        "${mydomain}": kv.get("mydomain", ""),
+    }
+    out = token
+    for key, value in replacements.items():
+        out = out.replace(key, value)
+    return out
+
+
+def _extract_map_paths(value: str) -> list[str]:
+    return list(dict.fromkeys(m.group(1) for m in MAP_SPEC_RE.finditer(value or "")))
+
+
+def _parse_mapping_file(root: Path, linux_path: str) -> list[tuple[str, str, int]]:
+    path = _root_path(root, linux_path)
+    text, actual, _method = _read_text_evidence(root, path)
+    if actual is not None:
+        path = actual
+    rows: list[tuple[str, str, int]] = []
+    if not text:
+        return rows
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Avoid accidentally exposing passwords in common credential maps.
+        if "password" in path.name.casefold() or "sasl_passwd" in path.name.casefold():
+            continue
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        lhs = parts[0].strip()
+        rhs = parts[1].strip() if len(parts) > 1 else ""
+        rows.append((lhs, rhs, line_no))
+    return rows
+
+
+def _add_account(store: dict[str, dict[str, Any]], address: str, source: str, evidence: str, detail: str = "") -> None:
+    address = address.strip().strip("<>").casefold()
+    if not address or "@" not in address or len(store) >= MAX_MAIL_ACCOUNTS:
+        return
+    row = store.get(address)
+    if row is None:
+        store[address] = {
+            "address": address,
+            "domain": address.split("@", 1)[1],
+            "assessment": "",
+            "evidence": evidence,
+            "source_file": source,
+            "detail": detail,
+        }
+        return
+    sources = {x.strip() for x in str(row.get("source_file", "")).split(" | ") if x.strip()}
+    sources.add(source)
+    row["source_file"] = " | ".join(sorted(sources))
+    evidences = {x.strip() for x in str(row.get("evidence", "")).split(" | ") if x.strip()}
+    evidences.add(evidence)
+    row["evidence"] = " | ".join(sorted(evidences))
+    if detail and detail not in str(row.get("detail", "")):
+        row["detail"] = (str(row.get("detail", "")) + " | " + detail).strip(" |")
+
+
+def _add_alias(store: dict[tuple[str, str], dict[str, Any]], alias: str, target: str, source: str, evidence: str) -> None:
+    alias = alias.strip().strip("<>")
+    target = target.strip().strip("<>")
+    if not alias or not target or len(store) >= MAX_MAIL_ALIASES:
+        return
+    key = (alias.casefold(), target.casefold())
+    if key in store:
+        return
+    alias_domain = alias.split("@", 1)[1].casefold() if "@" in alias else ""
+    target_domain = target.split("@", 1)[1].casefold() if "@" in target else ""
+    store[key] = {
+        "alias": alias,
+        "target": target,
+        "external_forward": "Ja" if alias_domain and target_domain and alias_domain != target_domain else "",
+        "evidence": evidence,
+        "source_file": source,
+    }
+
+
+def _scan_postfix(root: Path, result: MailScanResult, accounts: dict[str, dict[str, Any]], aliases: dict[tuple[str, str], dict[str, Any]]) -> None:
+    main_cf = root / "etc/postfix/main.cf"
+    text, main_actual, main_method = _read_text_evidence(root, main_cf)
+    if not text:
+        return
+    if main_actual is not None:
+        main_cf = main_actual
+    kv = _postfix_kv(text)
+    domains: set[str] = set()
+    for key in ("myhostname", "mydomain"):
+        value = kv.get(key, "").strip()
+        if value and "$" not in value:
+            domains.add(value.casefold())
+    for key in ("mydestination", "virtual_mailbox_domains", "relay_domains"):
+        for token in _tokens(kv.get(key, "")):
+            token = _expand_postfix_token(token, kv).strip()
+            if not token or token.startswith(("$", "hash:", "btree:", "lmdb:", "mysql:", "pgsql:", "ldap:", "regexp:", "pcre:")):
+                continue
+            if "." in token and "/" not in token and "=" not in token and not token.casefold().startswith("localhost"):
+                domains.add(token.casefold())
+        for map_path in _extract_map_paths(kv.get(key, "")):
+            for lhs, _rhs, _line in _parse_mapping_file(root, map_path):
+                if "@" not in lhs and "." in lhs:
+                    domains.add(lhs.casefold())
+
+    result.servers.append(
+        {
+            "component": "Postfix",
+            "hostname": kv.get("myhostname", ""),
+            "domains": ", ".join(sorted(domains)),
+            "relay": kv.get("relayhost", ""),
+            "interfaces": kv.get("inet_interfaces", ""),
+            "protocols": kv.get("inet_protocols", ""),
+            "source_file": _safe_rel(root, main_cf),
+            "notes": "Postfix-Hauptkonfiguration",
+        }
+    )
+
+    _diag(result, "Postfix", "Erkannte Maildomains", len(domains), "OK", _safe_rel(root, main_cf))
+    database_maps: list[str] = []
+    for map_key in ("virtual_mailbox_maps", "virtual_alias_maps", "local_recipient_maps", "alias_maps"):
+        value = kv.get(map_key, "")
+        for m in re.finditer(r"(?i)\b(mysql|pgsql|ldap|sqlite):([^\s,]+)", value):
+            database_maps.append(f"{map_key}: {m.group(1)}:{m.group(2)}")
+    if database_maps:
+        _diag(
+            result, "Postfix", "Datenbankbasierte Maps", len(database_maps), "Info",
+            " | ".join(database_maps[:12]),
+        )
+
+    for key in ("virtual_mailbox_maps", "local_recipient_maps"):
+        for map_path in _extract_map_paths(kv.get(key, "")):
+            src = map_path
+            for lhs, rhs, line_no in _parse_mapping_file(root, map_path):
+                for address in EMAIL_RE.findall(lhs):
+                    _add_account(accounts, address, src, f"Postfix {key}", f"Zeile {line_no}; Ziel: {rhs[:180]}")
+
+    for key in ("virtual_alias_maps", "alias_maps", "canonical_maps", "sender_canonical_maps", "recipient_canonical_maps"):
+        for map_path in _extract_map_paths(kv.get(key, "")):
+            for lhs, rhs, _line_no in _parse_mapping_file(root, map_path):
+                targets = EMAIL_RE.findall(rhs)
+                if not targets:
+                    # Local alias target can still be useful.
+                    targets = [x.strip() for x in rhs.split(",") if x.strip() and not x.strip().startswith("|")]
+                for target in targets:
+                    _add_alias(aliases, lhs, target, map_path, f"Postfix {key}")
+
+    # Debian/Ubuntu local aliases are common even if alias_maps contains database notation.
+    aliases_file = root / "etc/aliases"
+    aliases_text, aliases_actual, _aliases_method = _read_text_evidence(root, aliases_file)
+    if aliases_actual is not None:
+        aliases_file = aliases_actual
+    if aliases_text:
+        for raw in aliases_text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            lhs, rhs = line.split(":", 1)
+            for target in [x.strip() for x in rhs.split(",") if x.strip()]:
+                if target.startswith(("|", "/")):
+                    continue
+                _add_alias(aliases, lhs.strip(), target, _safe_rel(root, aliases_file), "/etc/aliases")
+
+
+def _is_domain_name(value: str) -> bool:
+    value = value.strip().strip(".").casefold()
+    return bool(re.fullmatch(r"(?=.{3,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", value))
+
+
+def _diag(result: MailScanResult, area: str, item: str, value: Any, status: str = "", source: str = "") -> None:
+    result.diagnostics.append(
+        {
+            "area": area,
+            "item": item,
+            "value": str(value),
+            "status": status,
+            "source_file": source,
+        }
+    )
+
+
+def _dovecot_include_candidates(root: Path, current: Path, spec: str) -> list[Path]:
+    value = spec.strip().strip('"\'')
+    if not value:
+        return []
+    if value.startswith("/"):
+        host_pattern = str(root / value.lstrip("/"))
+    else:
+        host_pattern = str(current.parent / value)
+    # Dovecot supports glob includes. glob() also handles ordinary paths.
+    matches = [Path(x) for x in glob.glob(host_pattern)]
+    if matches:
+        return matches
+    return [Path(host_pattern)]
+
+
+def _collect_dovecot_configs(root: Path) -> list[tuple[Path, str]]:
+    base = root / "etc/dovecot"
+    if not (base.exists() or _directory_accessible(base)):
+        return []
+    queue: list[Path] = []
+    main = base / "dovecot.conf"
+    if main.exists() or main.is_symlink():
+        queue.append(main)
+    # Inventory every small entry, not only *.conf. Forensic exports and custom
+    # deployments regularly use extension-less include files.
+    try:
+        for path in base.rglob("*"):
+            if path.is_dir():
+                continue
+            queue.append(path)
+    except OSError:
+        pass
+
+    out: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    while queue and len(seen) < 20_000:
+        path = queue.pop(0)
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        actual, _method = _resolve_evidence_path(root, path)
+        if actual is None:
+            continue
+        text = _read_text(actual)
+        if not text:
+            continue
+        out.append((path, text))
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^!include(?:_try)?\s+(.+?)\s*$", line, re.I)
+            if not m:
+                continue
+            queue.extend(_dovecot_include_candidates(root, path, m.group(1)))
+    return out
+
+
+def _expand_dovecot_user_path(root: Path, raw_path: str) -> list[Path]:
+    value = raw_path.strip().strip('"\'')
+    # Remove trailing punctuation often captured from old-style config syntax.
+    value = value.rstrip(")};,")
+    if not value.startswith("/"):
+        return []
+    pattern = value
+    # Dynamic passwd-file paths can contain user/domain variables. Replace them
+    # conservatively with a single path component wildcard for offline discovery.
+    pattern = re.sub(r"%\{[^}]+\}", "*", pattern)
+    pattern = re.sub(r"%(?:[udn])\b", "*", pattern)
+    host_pattern = str(root / pattern.lstrip("/"))
+    matches = [Path(x) for x in glob.glob(host_pattern)]
+    if matches:
+        return matches[:5000]
+    return [root / value.lstrip("/")] if "*" not in pattern else []
+
+
+def _infer_domain_from_path(path: Path, known_domains: set[str]) -> str:
+    for part in reversed(path.parts):
+        p = part.casefold()
+        if p in known_domains or _is_domain_name(p):
+            return p
+    return ""
+
+
+def _scan_dovecot(
+    root: Path,
+    result: MailScanResult,
+    accounts: dict[str, dict[str, Any]],
+    known_domains: set[str],
+) -> None:
+    base = root / "etc/dovecot"
+    if not (base.exists() or _directory_accessible(base)):
+        return
+    texts = _collect_dovecot_configs(root)
+    if not texts:
+        _diag(result, "Dovecot", "Konfiguration", "vorhanden, aber nicht lesbar", "Warnung", _safe_rel(root, base))
+        return
+    merged = "\n".join(text for _path, text in texts)
+    protocols = ""
+    listen = ""
+    mail_location = ""
+    mail_driver = ""
+    mail_path = ""
+    for line in _uncomment_lines(merged):
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        k = key.strip().casefold()
+        if k == "protocols" and not protocols:
+            protocols = value.strip()
+        elif k == "listen" and not listen:
+            listen = value.strip()
+        elif k == "mail_location" and not mail_location:
+            mail_location = value.strip()
+        elif k == "mail_driver" and not mail_driver:
+            mail_driver = value.strip()
+        elif k == "mail_path" and not mail_path:
+            mail_path = value.strip()
+    storage = mail_location or ": ".join(x for x in (mail_driver, mail_path) if x)
+    result.servers.append(
+        {
+            "component": "Dovecot",
+            "hostname": "",
+            "domains": ", ".join(sorted(known_domains)),
+            "relay": "",
+            "interfaces": listen,
+            "protocols": protocols,
+            "source_file": _safe_rel(root, base / "dovecot.conf") if (base / "dovecot.conf").exists() else _safe_rel(root, base),
+            "notes": f"Mailablage: {storage}" if storage else "Dovecot-Konfiguration vorhanden; Mailbox-Autodetektion möglich",
+        }
+    )
+    _diag(result, "Dovecot", "Konfigurationsdateien ausgewertet", len(texts), "OK", _safe_rel(root, base))
+    _diag(result, "Dovecot", "Mailablage", storage or "nicht explizit gesetzt / Autodetektion möglich", "Info", _safe_rel(root, base))
+
+    candidate_paths: set[str] = {"/etc/dovecot/users", "/etc/dovecot/passwd"}
+    for _path, text in texts:
+        for match in ABS_PATH_RE.finditer(text):
+            value = match.group(1).strip('"\'')
+            name = Path(value).name.casefold()
+            context = text[max(0, match.start()-120):match.end()+60].casefold()
+            if "user" in name or "passwd" in name or "passdb" in context or "userdb" in context:
+                candidate_paths.add(value)
+        # Old and new passwd-file syntax can place the file after args/path keys.
+        for m in re.finditer(r"(?mi)^\s*(?:args|passwd_file_path)\s*=\s*(?:[^/\r\n]*\s)?(/[^\r\n#]+)", text):
+            candidate_paths.add(m.group(1).strip())
+
+    readable_user_files = 0
+    for linux_path in sorted(candidate_paths):
+        for host_path in _expand_dovecot_user_path(root, linux_path):
+            actual, method = _resolve_evidence_path(root, host_path)
+            if actual is None:
+                continue
+            text = _read_text(actual)
+            if not text:
+                continue
+            readable_user_files += 1
+            inferred_domain = _infer_domain_from_path(actual, known_domains)
+            for line_no, raw in enumerate(text.splitlines(), start=1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                username = line.split(":", 1)[0].strip()
+                address = username
+                if "@" not in address and inferred_domain:
+                    address = f"{address}@{inferred_domain}"
+                elif "@" not in address and len(known_domains) == 1:
+                    address = f"{address}@{next(iter(known_domains))}"
+                if "@" in address:
+                    _add_account(
+                        accounts,
+                        address,
+                        _safe_rel(root, actual),
+                        "Dovecot Benutzerdatei",
+                        f"Zeile {line_no}; Auflösung: {method}; Kennwort-/Hashfelder werden nicht ausgegeben",
+                    )
+    _diag(result, "Dovecot", "Lesbare Benutzer-/Passwd-Dateien", readable_user_files, "OK" if readable_user_files else "Info")
+
+
+def _parse_plesk_mailnames_path(root: Path, result: MailScanResult) -> tuple[Path | None, str]:
+    psa = root / "etc/psa/psa.conf"
+    text, psa_actual, psa_method = _read_text_evidence(root, psa)
+    if psa_actual is not None:
+        psa = psa_actual
+    configured = ""
+    if text:
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(r"^PLESK_MAILNAMES_D\s+(.+?)\s*$", line)
+            if m:
+                configured = m.group(1).strip().strip('"\'')
+                break
+    if configured:
+        path = _root_path(root, configured)
+        actual, method = _resolve_evidence_path(root, path)
+        _diag(result, "Plesk", "PLESK_MAILNAMES_D", configured, method, _safe_rel(root, psa))
+        return actual or path, configured
+    default = root / "var/qmail/mailnames"
+    default_visible = default.exists() or default.is_symlink() or any(p.name == "mailnames" for p in _iter_entries(default.parent))
+    if default_visible:
+        actual, method = _resolve_directory(root, default)
+        _diag(result, "Plesk", "Mailstorage (Fallback)", "/var/qmail/mailnames", method, _safe_rel(root, default))
+        return actual or default, "/var/qmail/mailnames"
+    if text:
+        _diag(result, "Plesk", "PLESK_MAILNAMES_D", "nicht gefunden", "Warnung", _safe_rel(root, psa))
+    return None, ""
+
+
+def _scan_qmail_forwarding(
+    root: Path,
+    user_dir: Path,
+    address: str,
+    aliases: dict[tuple[str, str], dict[str, Any]],
+) -> int:
+    count = 0
+    for entry in _iter_entries(user_dir):
+        if not entry.name.casefold().startswith(".qmail"):
+            continue
+        actual, _method = _resolve_evidence_path(root, entry)
+        if actual is None:
+            continue
+        text = _read_text(actual)
+        if not text:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith(("|", "/", "./")):
+                continue
+            for target in EMAIL_RE.findall(line):
+                _add_alias(aliases, address, target, _safe_rel(root, actual), "Plesk/Qmail .qmail-Weiterleitung")
+                count += 1
     return count
 
 
-def _postfix_accounts(root: Path, accounts: dict[str, dict], diag: dict) -> None:
-    conf, main = _postfix_main(root)
-    diag["postfix_detected"] = bool(main)
-    diag["postfix_map_files"] = 0
-    diag["postfix_database_maps"] = []
-    diag["postfix_mail_domains"] = []
-    if not main:
-        return
-    domain_values: list[str] = []
-    for key in ("mydomain", "mydestination", "virtual_mailbox_domains", "relay_domains"):
-        val = conf.get(key, "")
-        domain_values.extend(DOMAIN_RE.findall(val))
-    diag["postfix_mail_domains"] = list(dict.fromkeys(x.lower() for x in domain_values))
-
-    for key, ev in (("virtual_mailbox_maps", "Postfix virtual_mailbox_maps"), ("virtual_alias_maps", "Postfix virtual_alias_maps"), ("alias_maps", "Postfix alias_maps")):
-        spec = conf.get(key, "")
-        if not spec:
+def _scan_mail_storage_base(
+    root: Path,
+    base: Path,
+    result: MailScanResult,
+    accounts: dict[str, dict[str, Any]],
+    aliases: dict[tuple[str, str], dict[str, Any]],
+    evidence: str,
+) -> tuple[int, int, int]:
+    actual_base, method = _resolve_directory(root, base)
+    if actual_base is None:
+        return 0, 0, 0
+    domains = accounts_found = unreadable = 0
+    for domain_entry in _iter_entries(actual_base):
+        domain = domain_entry.name.casefold()
+        if not _is_domain_name(domain):
             continue
-        paths, non_file = _postfix_map_paths(root, spec, main.parent)
-        diag["postfix_database_maps"].extend(non_file)
-        for p in paths:
-            diag["postfix_map_files"] += _parse_map_file(root, p, accounts, ev)
-
-
-def _dovecot_files(root: Path) -> tuple[list[Path], dict]:
-    start = root / "etc/dovecot/dovecot.conf"
-    diag = {"dovecot_detected": start.is_file(), "dovecot_config_files": 0, "dovecot_mail_locations": [], "dovecot_user_files": []}
-    queue = [start] if start.is_file() else []
-    # Also recover configs if main file is absent/incomplete.
-    confd = root / "etc/dovecot/conf.d"
-    if confd.exists():
-        try:
-            queue.extend(p for p in confd.iterdir() if p.is_file())
-        except OSError:
-            pass
-    seen: set[Path] = set()
-    while queue:
-        p, _ = resolve_evidence_path(root, queue.pop(0))
-        if not p.is_file():
+        domain_dir, _dmethod = _resolve_directory(root, domain_entry)
+        if domain_dir is None:
+            unreadable += 1
             continue
-        k = p.resolve(strict=False)
-        if k in seen:
-            continue
-        seen.add(k)
-        text = safe_read_text(p)
-        for m in re.finditer(r"(?im)^\s*!include(?:_try)?\s+(.+?)\s*$", text):
-            token = m.group(1).strip().strip('"\'')
-            host = linux_to_host(root, token, p.parent)
-            if any(c in str(host) for c in "*?["):
-                try:
-                    queue.extend(x for x in host.parent.glob(host.name) if x.is_file())
-                except OSError:
-                    pass
-            else:
-                queue.append(host)
-    diag["dovecot_config_files"] = len(seen)
-    return sorted(seen, key=lambda p: str(p).casefold()), diag
-
-
-def _expand_dovecot_pattern(root: Path, pattern: str) -> list[Path]:
-    # %d/%u/%n cannot be fully resolved without account context. Use a bounded
-    # recursive search for the fixed basename where possible.
-    if "%" not in pattern:
-        return [linux_to_host(root, pattern)]
-    base_name = Path(pattern).name
-    if "%" in base_name:
-        # Try all regular text files below the fixed prefix.
-        fixed = pattern.split("%", 1)[0].rstrip("/")
-        base = linux_to_host(root, fixed or "/etc/dovecot")
-        if base.is_file():
-            base = base.parent
-        try:
-            return [p for p in base.rglob("*") if p.is_file()][:1000]
-        except OSError:
-            return []
-    fixed_dir = pattern.rsplit("/", 1)[0].split("%", 1)[0].rstrip("/")
-    base = linux_to_host(root, fixed_dir or "/etc/dovecot")
-    try:
-        return [p for p in base.rglob(base_name) if p.is_file()][:1000]
-    except OSError:
-        return []
-
-
-def _dovecot_accounts(root: Path, accounts: dict[str, dict], diag: dict) -> None:
-    files, d = _dovecot_files(root)
-    diag.update(d)
-    user_files: set[Path] = set()
-    for p in files:
-        text = safe_read_text(p)
-        for m in re.finditer(r"(?im)^\s*(?:mail_location|mail_path)\s*=\s*(.+?)\s*$", text):
-            val = m.group(1).strip()
-            if val not in diag["dovecot_mail_locations"]:
-                diag["dovecot_mail_locations"].append(val)
-        # Passwd-file commonly uses args = /etc/dovecot/users or passwd_file_path.
-        for m in re.finditer(r"(?im)^\s*(?:args|passwd_file_path)\s*=\s*(?:scheme=[^\s]+\s+)?(.+?)\s*$", text):
-            val = m.group(1).strip().split()[0].strip('"\'')
-            if val.startswith("/") and ("user" in val.lower() or "passwd" in val.lower() or "%" in val):
-                user_files.update(_expand_dovecot_pattern(root, val))
-    diag["dovecot_user_files"] = [rel_source(root, p) for p in sorted(user_files, key=lambda x: str(x).casefold())]
-    for p in user_files:
-        for line in safe_read_text(p, 16 * 1024 * 1024).splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
+        domains += 1
+        for user_entry in _iter_entries(domain_dir):
+            user = user_entry.name
+            if not user or user.startswith("."):
                 continue
-            login = line.split(":", 1)[0].strip()
-            if _valid_email(login):
-                _add_account(accounts, login, "Dovecot userdb/passwd-file", rel_source(root, p), strong=False)
+            user_dir, umethod = _resolve_directory(root, user_entry)
+            if user_dir is None:
+                unreadable += 1
+                continue
+            address = f"{user}@{domain}".casefold()
+            markers: list[str] = []
+            for candidate, label in (
+                (user_dir / "Maildir", "Maildir"),
+                (user_dir / "mdbox", "mdbox"),
+                (user_dir / "sdbox", "sdbox"),
+            ):
+                resolved, _ = _resolve_evidence_path(root, candidate)
+                if resolved is not None:
+                    try:
+                        if resolved.is_dir():
+                            markers.append(label)
+                    except OSError:
+                        pass
+            # Some Maildir layouts use the user directory itself as Maildir.
+            if not markers:
+                direct_parts = []
+                for name in ("cur", "new", "tmp"):
+                    resolved, _ = _resolve_evidence_path(root, user_dir / name)
+                    if resolved is not None:
+                        try:
+                            if resolved.is_dir():
+                                direct_parts.append(name)
+                        except OSError:
+                            pass
+                if len(direct_parts) >= 2:
+                    markers.append("Maildir")
+            account_evidence = evidence + (" / Mailboxformat festgestellt" if markers else " / Account-Verzeichnis")
+            _add_account(
+                accounts,
+                address,
+                _safe_rel(root, user_dir),
+                account_evidence,
+                f"Storage-Auflösung: {method}/{umethod}" + (f"; Mailboxformat-Hinweis: {', '.join(markers)}" if markers else ""),
+            )
+            accounts_found += 1
+            _scan_qmail_forwarding(root, user_dir, address, aliases)
+    return domains, accounts_found, unreadable
 
 
-def _classic_mailboxes(root: Path, accounts: dict[str, dict], diag: dict) -> None:
-    diag["classic_mailboxes"] = 0
-    for rel in ("var/mail", "var/spool/mail"):
-        base = root / rel
-        if not base.exists():
+def _scan_plesk_mail(
+    root: Path,
+    result: MailScanResult,
+    accounts: dict[str, dict[str, Any]],
+    aliases: dict[tuple[str, str], dict[str, Any]],
+) -> set[str]:
+    base, configured = _parse_plesk_mailnames_path(root, result)
+    if base is None:
+        return set()
+    domains, account_count, unreadable = _scan_mail_storage_base(
+        root, base, result, accounts, aliases, "Plesk Mailstorage / PLESK_MAILNAMES_D"
+    )
+    actual_rel = _safe_rel(root, base)
+    result.servers.append(
+        {
+            "component": "Plesk Mail Storage",
+            "hostname": "",
+            "domains": "",
+            "relay": "",
+            "interfaces": "",
+            "protocols": "Mailbox-Storage",
+            "source_file": actual_rel,
+            "notes": f"PLESK_MAILNAMES_D={configured}; erkannte Domainverzeichnisse: {domains}; Mailkonten: {account_count}",
+        }
+    )
+    _diag(result, "Plesk", "Maildomain-Verzeichnisse", domains, "OK", actual_rel)
+    _diag(result, "Plesk", "Mailbox-/Account-Verzeichnisse", account_count, "OK", actual_rel)
+    _diag(result, "Plesk", "Nicht lesbare Storage-Einträge", unreadable, "Warnung" if unreadable else "OK", actual_rel)
+    return {row["domain"] for row in accounts.values() if row.get("domain") and "Plesk" in row.get("evidence", "")}
+
+
+def _scan_exim(root: Path, result: MailScanResult) -> None:
+    candidates = [
+        root / "etc/exim4/update-exim4.conf.conf",
+        root / "etc/exim/exim.conf",
+        root / "etc/exim4/exim4.conf.template",
+    ]
+    for path in candidates:
+        text, actual, _method = _read_text_evidence(root, path)
+        if not text:
+            continue
+        if actual is not None:
+            path = actual
+        kv: dict[str, str] = {}
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            kv[key.strip().casefold()] = value.strip().strip("'\"")
+        result.servers.append(
+            {
+                "component": "Exim",
+                "hostname": kv.get("primary_hostname", ""),
+                "domains": kv.get("dc_other_hostnames", ""),
+                "relay": kv.get("dc_smarthost", ""),
+                "interfaces": kv.get("dc_local_interfaces", ""),
+                "protocols": "SMTP",
+                "source_file": _safe_rel(root, path),
+                "notes": "Exim-Konfiguration",
+            }
+        )
+        break
+
+
+def _scan_maildir_structures(
+    root: Path,
+    result: MailScanResult,
+    accounts: dict[str, dict[str, Any]],
+    aliases: dict[tuple[str, str], dict[str, Any]],
+    known_domains: set[str],
+    skip_bases: set[str] | None = None,
+) -> None:
+    skip_bases = {x.casefold() for x in (skip_bases or set())}
+    bases = [
+        root / "var/vmail",
+        root / "var/mail/vhosts",
+        root / "var/qmail/mailnames",
+        root / "srv/vmail",
+        root / "srv/mail",
+    ]
+    for base in bases:
+        if _safe_rel(root, base).casefold() in skip_bases:
+            continue
+        domains, count, unreadable = _scan_mail_storage_base(
+            root, base, result, accounts, aliases, "Maildir/Vmail-Verzeichnisstruktur"
+        )
+        if domains or count or unreadable:
+            _diag(result, "Mailstorage", f"{_safe_rel(root, base)} Domains/Konten", f"{domains}/{count}", "OK", _safe_rel(root, base))
+            if unreadable:
+                _diag(result, "Mailstorage", f"{_safe_rel(root, base)} nicht lesbare Einträge", unreadable, "Warnung", _safe_rel(root, base))
+
+    # System-user Maildir locations. Only construct a full address when the domain
+    # can be inferred with reasonable confidence; otherwise retain a diagnostic.
+    home_count = 0
+    homes = root / "home"
+    if homes.exists():
+        for user_dir in _iter_entries(homes):
+            actual_user, _ = _resolve_evidence_path(root, user_dir)
+            if actual_user is None:
+                continue
+            maildir, _ = _resolve_evidence_path(root, actual_user / "Maildir")
+            if maildir is None:
+                continue
+            try:
+                if not maildir.is_dir():
+                    continue
+            except OSError:
+                continue
+            home_count += 1
+            if len(known_domains) == 1:
+                domain = next(iter(known_domains))
+                _add_account(
+                    accounts,
+                    f"{user_dir.name}@{domain}",
+                    _safe_rel(root, maildir),
+                    "Systembenutzer-Maildir",
+                    "Adresse aus eindeutigem Maildomain-Kontext abgeleitet",
+                )
+    if home_count:
+        _diag(result, "Mailstorage", "Systembenutzer-Maildir-Verzeichnisse", home_count, "Info", "/home/*/Maildir")
+
+    # Traditional mbox inboxes under /var/mail or /var/spool/mail.
+    mbox_count = 0
+    for base in (root / "var/mail", root / "var/spool/mail"):
+        actual_base, _ = _resolve_evidence_path(root, base)
+        if actual_base is None:
+            continue
+        for entry in _iter_entries(actual_base):
+            actual, _ = _resolve_evidence_path(root, entry)
+            if actual is None:
+                continue
+            try:
+                if not actual.is_file() or actual.stat().st_size < 0:
+                    continue
+            except OSError:
+                continue
+            # Ignore lock/index-ish files and domain directories handled above.
+            if entry.name.startswith(".") or "." in entry.name:
+                continue
+            mbox_count += 1
+            if len(known_domains) == 1:
+                domain = next(iter(known_domains))
+                _add_account(
+                    accounts,
+                    f"{entry.name}@{domain}",
+                    _safe_rel(root, actual),
+                    "System-mbox",
+                    "Adresse aus eindeutigem Maildomain-Kontext abgeleitet",
+                )
+    if mbox_count:
+        _diag(result, "Mailstorage", "System-mbox-Dateien", mbox_count, "Info", "/var/mail bzw. /var/spool/mail")
+
+
+
+def _scan_application_mail_configs(root: Path, result: MailScanResult, accounts: dict[str, dict[str, Any]]) -> None:
+    """Extract safe mail identity/settings from common web-application configs.
+
+    Password/secret keys are intentionally ignored.
+    """
+    search_bases = [root / "var/www", root / "srv/www", root / "opt"]
+    scanned = 0
+
+    # Nextcloud config.php
+    for base in search_bases:
+        if not base.is_dir() or scanned >= 120:
             continue
         try:
-            for p in base.iterdir():
-                if p.is_file() and p.stat().st_size >= 0:
-                    # Local Unix mailbox: address may not be known without domain.
-                    diag["classic_mailboxes"] += 1
+            for occ in base.rglob("occ"):
+                if scanned >= 120:
+                    break
+                config = occ.parent / "config" / "config.php"
+                text = _read_text(config)
+                if not occ.is_file() or not text:
+                    continue
+                scanned += 1
+                values: dict[str, str] = {}
+                for key in (
+                    "mail_from_address", "mail_domain", "mail_smtpmode", "mail_sendmailmode",
+                    "mail_smtphost", "mail_smtpport", "mail_smtpsecure", "mail_smtpauth", "mail_smtpname",
+                ):
+                    m = re.search(rf"(?i)['\"]{re.escape(key)}['\"]\s*=>\s*(?:['\"]([^'\"]*)['\"]|([0-9]+)|true|false)", text)
+                    if m:
+                        values[key] = (m.group(1) or m.group(2) or "").strip()
+                if not values:
+                    continue
+                from_local = values.get("mail_from_address", "")
+                domain = values.get("mail_domain", "")
+                from_address = f"{from_local}@{domain}" if from_local and domain and "@" not in from_local else from_local
+                smtp_user = values.get("mail_smtpname", "")
+                if "@" in from_address:
+                    _add_account(accounts, from_address, _safe_rel(root, config), "Nextcloud Mail-Konfiguration")
+                if "@" in smtp_user:
+                    _add_account(accounts, smtp_user, _safe_rel(root, config), "Nextcloud SMTP-Benutzer")
+                relay = values.get("mail_smtphost", "")
+                if values.get("mail_smtpport"):
+                    relay = f"{relay}:{values['mail_smtpport']}" if relay else values["mail_smtpport"]
+                notes = []
+                if from_address:
+                    notes.append(f"Absender: {from_address}")
+                if smtp_user:
+                    notes.append(f"SMTP-Benutzer: {smtp_user}")
+                if values.get("mail_smtpsecure"):
+                    notes.append(f"Transport: {values['mail_smtpsecure']}")
+                result.servers.append(
+                    {
+                        "component": "Nextcloud Mail",
+                        "hostname": "",
+                        "domains": domain,
+                        "relay": relay,
+                        "interfaces": "",
+                        "protocols": values.get("mail_smtpmode", "SMTP"),
+                        "source_file": _safe_rel(root, config),
+                        "notes": "; ".join(notes) or "Nextcloud Mail-Konfiguration",
+                    }
+                )
         except OSError:
-            pass
-    # Home Maildir can still be a strong mailbox existence signal; map to an
-    # email only when the home directory name itself already looks like one.
-    for rel in ("home", "root"):
-        base = root / rel
-        if not base.exists():
+            continue
+
+    # Common .env mail settings (Laravel and similar). Only a strict allow-list is read.
+    env_keys = {
+        "MAIL_MAILER", "MAIL_DRIVER", "MAIL_HOST", "MAIL_PORT", "MAIL_USERNAME",
+        "MAIL_FROM_ADDRESS", "MAIL_FROM_NAME", "MAIL_ENCRYPTION",
+    }
+    env_seen = 0
+    for base in search_bases:
+        if not base.is_dir() or env_seen >= 120:
             continue
         try:
-            for md in base.rglob("Maildir"):
-                if not md.is_dir():
+            for env_file in base.rglob(".env"):
+                if env_seen >= 120:
+                    break
+                text = _read_text(env_file)
+                if not text:
                     continue
-                if not any((md / x).is_dir() for x in ("cur", "new", "tmp")):
+                values: dict[str, str] = {}
+                for raw in text.splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip().upper()
+                    if key not in env_keys:
+                        continue
+                    values[key] = value.strip().strip('"\'')
+                if not values or not any(k in values for k in ("MAIL_HOST", "MAIL_USERNAME", "MAIL_FROM_ADDRESS")):
                     continue
-                owner = md.parent.name
-                if _valid_email(owner):
-                    _add_account(accounts, owner, "Maildir im Dateisystem", rel_source(root, md), rel_source(root, md), strong=True)
+                env_seen += 1
+                username = values.get("MAIL_USERNAME", "")
+                from_address = values.get("MAIL_FROM_ADDRESS", "")
+                for address, evidence in ((username, "Anwendungs-.env SMTP-Benutzer"), (from_address, "Anwendungs-.env Absender")):
+                    if "@" in address:
+                        _add_account(accounts, address, _safe_rel(root, env_file), evidence)
+                relay = values.get("MAIL_HOST", "")
+                port = values.get("MAIL_PORT", "")
+                if port:
+                    relay = f"{relay}:{port}" if relay else port
+                domain = from_address.split("@", 1)[1] if "@" in from_address else ""
+                notes = []
+                if from_address:
+                    notes.append(f"Absender: {from_address}")
+                if username:
+                    notes.append(f"SMTP-Benutzer: {username}")
+                if values.get("MAIL_ENCRYPTION"):
+                    notes.append(f"Verschlüsselung: {values['MAIL_ENCRYPTION']}")
+                result.servers.append(
+                    {
+                        "component": "Application .env Mail",
+                        "hostname": "",
+                        "domains": domain,
+                        "relay": relay,
+                        "interfaces": "",
+                        "protocols": values.get("MAIL_MAILER", "") or values.get("MAIL_DRIVER", ""),
+                        "source_file": _safe_rel(root, env_file),
+                        "notes": "; ".join(notes) or "Mail-Konfiguration in .env",
+                    }
+                )
         except OSError:
-            pass
+            continue
 
-
-def _parse_mail_time(value: str) -> str:
-    # Syslog without year cannot be safely normalized without image acquisition
-    # context; retain the literal value if conversion is ambiguous.
-    value = value.strip()
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
-    except ValueError:
-        return value
-
-
-def _mail_log_paths(root: Path) -> list[Path]:
-    patterns = ["var/log/mail.log*", "var/log/maillog*", "var/log/syslog*", "var/log/plesk/maillog*"]
-    out: set[Path] = set()
-    for pattern in patterns:
+def discover_mail_logs(root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    bases = [root / "var/log", root / "usr/local/psa/var/log"]
+    names = ("mail.log", "maillog", "mail.info", "mail.warn", "mail.err")
+    for base in bases:
+        if not base.is_dir():
+            continue
         try:
-            out.update(p for p in root.glob(pattern) if p.is_file())
+            for path in base.iterdir():
+                n = path.name.casefold()
+                if not path.is_file():
+                    continue
+                if any(n == name or n.startswith(name + ".") for name in names):
+                    candidates.append(path)
         except OSError:
-            pass
-    return sorted(out, key=lambda p: str(p).casefold())
+            continue
+    return sorted(candidates, key=lambda p: (p.name.casefold(), str(p)))[:MAX_MAIL_LOG_FILES]
 
 
-def extract_mail_access(root: Path, journal_events: Iterable[dict[str, str]], ssh_logins: list[dict]) -> list[dict]:
-    ssh_ips = {x.get("ip", "") for x in ssh_logins}
-    out: list[MailAccess] = []
+def _open_log(path: Path):
+    if path.suffix.casefold() == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("rt", encoding="utf-8", errors="replace")
+
+
+def _raw_time_prefix(line: str) -> str:
+    # Preserve the source representation; traditional syslog often has no year/timezone.
+    iso = re.match(r"^(\d{4}-\d{2}-\d{2}T\S+)", line)
+    if iso:
+        return iso.group(1)
+    traditional = re.match(r"^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})", line)
+    return traditional.group(1) if traditional else ""
+
+
+def _mail_access_from_message(message: str, time_value: str, source: str, line_no: int | str = "") -> dict[str, Any] | None:
+    match = DOVECOT_LOGIN_RE.search(message)
+    if match:
+        ip = _valid_ip(match.group("ip"))
+        if ip:
+            return {
+                "time": time_value,
+                "service": "Dovecot IMAP/POP3",
+                "result": "Anmeldung erfolgreich",
+                "user": match.group("user"),
+                "ip": ip,
+                "source_file": source,
+                "line": line_no,
+                "message": message.strip()[:1000],
+            }
+    match = POSTFIX_SASL_RE.search(message)
+    if match:
+        ip = _valid_ip(match.group("ip"))
+        if ip:
+            return {
+                "time": time_value,
+                "service": "Postfix SMTP AUTH",
+                "result": "Authentifizierung erfolgreich",
+                "user": match.group("user"),
+                "ip": ip,
+                "source_file": source,
+                "line": line_no,
+                "message": message.strip()[:1000],
+            }
+    match = EXIM_AUTH_RE.search(message)
+    if match:
+        ip = _valid_ip(match.group("ip"))
+        if ip:
+            return {
+                "time": time_value,
+                "service": "Exim Auth",
+                "result": "Authentifizierungshinweis",
+                "user": match.group("user"),
+                "ip": ip,
+                "source_file": source,
+                "line": line_no,
+                "message": message.strip()[:1000],
+            }
+    return None
+
+
+def _scan_mail_accesses(root: Path, events: list[dict[str, Any]], result: MailScanResult) -> None:
+    rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str]] = set()
 
-    dovecot_rx = re.compile(r"(?i)(?:imap|pop3)-login:.*?Login: user=<(?P<user>[^>]+)>.*?(?:rip|remote_ip)=(?P<ip>[0-9a-f:.]+)")
-    postfix_rx = re.compile(r"(?i)sasl_username=(?P<user>[^,\s]+).*(?:client=.*?\[(?P<ip1>[0-9a-f:.]+)\]|rip=(?P<ip2>[0-9a-f:.]+))")
-    postfix_rx2 = re.compile(r"(?i)(?:client=.*?\[(?P<ip>[0-9a-f:.]+)\].*?)sasl_username=(?P<user>[^,\s]+)")
-
-    def add(ts: str, protocol: str, user: str, ip: str, source: str) -> None:
-        addr = _valid_email(user) or user
-        key = (ts, protocol, addr, ip)
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(MailAccess(ts, protocol, addr, ip, "erfolgreich", source, ip in ssh_ips))
-
-    for e in journal_events:
-        msg = e.get("MESSAGE", "")
-        ts = e.get("__DATETIME_UTC") or e.get("__REALTIME_TIMESTAMP", "")
-        m = dovecot_rx.search(msg)
-        if m:
-            proto = "POP3" if "pop3-login" in msg.lower() else "IMAP"
-            add(ts, proto, m.group("user"), m.group("ip"), e.get("__SOURCE_FILE", "journal"))
+    for event in events:
+        message = str(event.get("message", ""))
+        ident = f"{event.get('service', '')} {event.get('unit', '')}".casefold()
+        if not any(x in ident or x in message.casefold() for x in ("dovecot", "postfix", "exim")):
             continue
-        m = postfix_rx.search(msg) or postfix_rx2.search(msg)
-        if m:
-            ip = m.groupdict().get("ip") or m.groupdict().get("ip1") or m.groupdict().get("ip2") or ""
-            add(ts, "SMTP AUTH", m.group("user"), ip, e.get("__SOURCE_FILE", "journal"))
-
-    for p in _mail_log_paths(root):
-        for line in safe_read_text(p, 64 * 1024 * 1024).splitlines():
-            m = dovecot_rx.search(line)
-            if m:
-                proto = "POP3" if "pop3-login" in line.lower() else "IMAP"
-                add(line[:15].strip(), proto, m.group("user"), m.group("ip"), rel_source(root, p))
-                continue
-            m = postfix_rx.search(line) or postfix_rx2.search(line)
-            if m:
-                ip = m.groupdict().get("ip") or m.groupdict().get("ip1") or m.groupdict().get("ip2") or ""
-                add(line[:15].strip(), "SMTP AUTH", m.group("user"), ip, rel_source(root, p))
-
-    return [asdict(x) for x in sorted(out, key=lambda x: x.timestamp)]
-
-
-def analyze_mail(root: Path, journal_events: Iterable[dict[str, str]], ssh_logins: list[dict]) -> dict:
-    accounts: dict[str, dict] = {}
-    diag: dict = {}
-    _plesk_accounts(root, accounts, diag)
-    _postfix_accounts(root, accounts, diag)
-    _dovecot_accounts(root, accounts, diag)
-    _classic_mailboxes(root, accounts, diag)
-    accesses = extract_mail_access(root, journal_events, ssh_logins)
-    for access in accesses:
-        user = access.get("user", "")
-        if _valid_email(user):
-            _add_account(accounts, user, f"Erfolgreicher {access['protocol']}-Login", access["source"], strong=True)
-
-    final_accounts: list[MailAccount] = []
-    for address, row in sorted(accounts.items()):
-        physical = bool(row["mailbox_path"])
-        authenticated = any(e.startswith("Erfolgreicher") for e in row["evidence"])
-        if physical or authenticated or row["strong"]:
-            assessment = "Belegt"
-        elif any("Postfix" in e or "Dovecot" in e or "Plesk" in e for e in row["evidence"]):
-            assessment = "Konfiguriert"
-        else:
-            assessment = "Hinweis"
-        final_accounts.append(
-            MailAccount(
-                address=address,
-                assessment=assessment,
-                evidence=row["evidence"],
-                mailbox_path=row["mailbox_path"],
-                forwarding=row["forwarding"],
-                source=row["sources"],
-            )
+        row = _mail_access_from_message(
+            message,
+            str(event.get("time_utc", "")),
+            str(event.get("source_file", "Journal")),
+            "Journal",
         )
+        if row:
+            key = (row["time"], row["user"], row["ip"], row["service"])
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
 
-    diag["accounts_total"] = len(final_accounts)
-    diag["accounts_belegt"] = sum(1 for x in final_accounts if x.assessment == "Belegt")
-    diag["accounts_konfiguriert"] = sum(1 for x in final_accounts if x.assessment == "Konfiguriert")
-    diag["forwardings"] = sum(len(x.forwarding or []) for x in final_accounts)
-    diag["authenticated_accesses"] = len(accesses)
-    return {
-        "accounts": [asdict(x) for x in final_accounts],
-        "accesses": accesses,
-        "diagnostics": diag,
-    }
+    logs = discover_mail_logs(root)
+    result.log_files = [_safe_rel(root, path) for path in logs]
+    for path in logs:
+        if len(rows) >= MAX_MAIL_ACCESSES:
+            break
+        try:
+            with _open_log(path) as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    if line_no > MAX_MAIL_LOG_LINES or len(rows) >= MAX_MAIL_ACCESSES:
+                        break
+                    lower = line.casefold()
+                    if "login:" not in lower and "sasl_username=" not in lower and "auth" not in lower:
+                        continue
+                    row = _mail_access_from_message(line, _raw_time_prefix(line), _safe_rel(root, path), line_no)
+                    if not row:
+                        continue
+                    key = (row["time"], row["user"], row["ip"], row["service"])
+                    if key not in seen:
+                        seen.add(key)
+                        rows.append(row)
+        except (OSError, EOFError, gzip.BadGzipFile):
+            continue
+    result.accesses = sorted(rows, key=lambda r: str(r.get("time", "")), reverse=True)
+    if len(rows) >= MAX_MAIL_ACCESSES:
+        result.notes.append(f"Mail-Login-Auswertung auf {MAX_MAIL_ACCESSES:,} Treffer begrenzt.".replace(",", "."))
+
+
+def _known_domains(result: MailScanResult, accounts: dict[str, dict[str, Any]]) -> set[str]:
+    domains: set[str] = set()
+    for row in result.servers:
+        for token in re.split(r"[,\s]+", str(row.get("domains", ""))):
+            token = token.strip().strip(".").casefold()
+            if _is_domain_name(token):
+                domains.add(token)
+    for row in accounts.values():
+        domain = str(row.get("domain", "")).casefold()
+        if _is_domain_name(domain):
+            domains.add(domain)
+    return domains
+
+
+def _finalize_accounts(
+    accounts: dict[str, dict[str, Any]],
+    accesses: list[dict[str, Any]],
+    known_domains: set[str],
+) -> None:
+    # Authentication itself is independent corroboration of an account/login name.
+    for access in accesses:
+        user = str(access.get("user", "")).strip().strip("<>").casefold()
+        address = user
+        detail = f"{access.get('service', '')}; Quell-IP {access.get('ip', '')}; Zeit {access.get('time', '')}"
+        if "@" not in address and len(known_domains) == 1 and address:
+            address = f"{address}@{next(iter(known_domains))}"
+            detail += "; Domain aus eindeutigem Maildomain-Kontext abgeleitet"
+        if "@" in address:
+            _add_account(accounts, address, str(access.get("source_file", "")), "Erfolgreiche Mail-Authentifizierung", detail)
+
+    strong_terms = (
+        "mailboxformat festgestellt", "system-mbox", "systembenutzer-maildir",
+        "erfolgreiche mail-authentifizierung",
+    )
+    configured_terms = (
+        "account-verzeichnis", "postfix virtual_mailbox", "postfix local_recipient", "dovecot benutzerdatei"
+    )
+    for row in accounts.values():
+        evidence = str(row.get("evidence", "")).casefold()
+        if any(term in evidence for term in strong_terms):
+            row["assessment"] = "Belegt"
+        elif any(term in evidence for term in configured_terms):
+            row["assessment"] = "Konfiguriert"
+        else:
+            row["assessment"] = "Hinweis"
+
+
+def scan_mail(root: Path, events: list[dict[str, Any]]) -> MailScanResult:
+    result = MailScanResult()
+    accounts: dict[str, dict[str, Any]] = {}
+    aliases: dict[tuple[str, str], dict[str, Any]] = {}
+
+    _scan_postfix(root, result, accounts, aliases)
+    # Plesk can define a non-default mail storage root in /etc/psa/psa.conf.
+    _scan_plesk_mail(root, result, accounts, aliases)
+    known_domains = _known_domains(result, accounts)
+
+    _scan_dovecot(root, result, accounts, known_domains)
+    _scan_exim(root, result)
+    known_domains = _known_domains(result, accounts)
+    _scan_maildir_structures(root, result, accounts, aliases, known_domains)
+    _scan_application_mail_configs(root, result, accounts)
+    _scan_mail_accesses(root, events, result)
+
+    known_domains = _known_domains(result, accounts)
+    _finalize_accounts(accounts, result.accesses, known_domains)
+    known_domains = _known_domains(result, accounts)
+
+    result.accounts = sorted(accounts.values(), key=lambda r: (r.get("domain", ""), r.get("address", "")))
+    result.aliases = sorted(aliases.values(), key=lambda r: (r.get("alias", ""), r.get("target", "")))
+
+    _diag(result, "Zusammenfassung", "Erkannte Maildomains", len(known_domains), "OK")
+    _diag(result, "Zusammenfassung", "Erkannte Mail-Adressen", len(result.accounts), "OK")
+    _diag(result, "Zusammenfassung", "Aliase / Weiterleitungen", len(result.aliases), "OK")
+    _diag(result, "Zusammenfassung", "Authentifizierte Mailzugriffe", len(result.accesses), "OK")
+    _diag(result, "Zusammenfassung", "Ausgewertete Mail-Logdateien", len(result.log_files), "OK" if result.log_files else "Info")
+
+    if not result.servers:
+        result.notes.append("Keine unterstützte Postfix-/Dovecot-/Exim-/Plesk-Mailkonfiguration erkannt.")
+    if not result.accounts:
+        result.notes.append("Keine Mailkonten aus unterstützten Konfigurationen, Mailstorage-Strukturen oder Authentifizierungslogs abgeleitet.")
+    if any(row.get("status") == "Warnung" for row in result.diagnostics):
+        result.notes.append(
+            "Mail-Diagnose enthält Warnungen zu nicht lesbaren oder nicht auflösbaren Pfaden. "
+            "Dies kann bei unter Windows eingebundenen Linux-Dateisystemen auf Symlink-/Mount-Eigenschaften zurückzuführen sein."
+        )
+    return result
+

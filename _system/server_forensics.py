@@ -1,922 +1,1353 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Gl1tchb1rd
-
 from __future__ import annotations
 
-import base64
-import fnmatch
-import hashlib
+import gzip
+import glob
 import ipaddress
 import os
 import re
-from dataclasses import dataclass, asdict
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Callable, Iterable
 
-DOMAIN_RE = re.compile(r"(?i)(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![\w.-])")
-IP_RE = re.compile(r"(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?![\w:])")
-NGINX_DIRECTIVE_RE = re.compile(r"(?ms)^\s*([a-zA-Z_][\w-]*)\s+([^;{}]+);")
-LOG_RE = re.compile(
-    r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+"(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+HTTP/[^\"]+)?"\s+(?P<status>\d{3})\s+(?P<size>\S+)(?:\s+"(?P<ref>[^\"]*)"\s+"(?P<ua>[^\"]*)")?'
+from mail_forensics import scan_mail
+from operator_artifacts import scan_operator_artifacts
+from tls_forensics import scan_tls_certificates
+
+MAX_TEXT_FILE = 32 * 1024 * 1024
+MAX_CONFIG_FILE = 8 * 1024 * 1024
+MAX_ACCESS_LOGS = 500
+MAX_APP_MARKERS = 250
+MAX_ADMIN_FINDINGS = 200_000
+MAX_ACCESS_LINES_PER_FILE = 2_000_000
+MAX_ACCESS_LINE_LENGTH = 1_000_000
+
+ACCESS_RE = re.compile(
+    r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+'
+    r'"(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+HTTP/[^"]+)?"\s+'
+    r'(?P<status>\d{3})\s+(?P<size>\S+)'
+    r'(?:\s+"(?P<referrer>[^"]*)"\s+"(?P<ua>[^"]*)")?'
 )
 
-SECRET_KEYWORDS = ("password", "passwd", "secret", "token", "apikey", "api_key", "authorization", "cookie", "session")
+NGINX_SERVER_NAME_RE = re.compile(r"\bserver_name\s+([^;]+);", re.I)
+NGINX_ROOT_RE = re.compile(r"\broot\s+([^;]+);", re.I)
+NGINX_LISTEN_RE = re.compile(r"\blisten\s+([^;]+);", re.I)
+NGINX_PROXY_PASS_RE = re.compile(r"\bproxy_pass\s+([^;]+);", re.I)
+NGINX_ACCESS_LOG_RE = re.compile(r"\baccess_log\s+([^;]+);", re.I)
+NGINX_ERROR_LOG_RE = re.compile(r"\berror_log\s+([^;]+);", re.I)
+NGINX_SSL_CERT_RE = re.compile(r"\bssl_certificate\s+([^;]+);", re.I)
+NGINX_FASTCGI_RE = re.compile(r"\bfastcgi_pass\s+([^;]+);", re.I)
+NGINX_INCLUDE_RE = re.compile(r"\binclude\s+([^;]+);", re.I)
+NGINX_DOMAIN_FILENAME_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$", re.I)
+APACHE_VHOST_RE = re.compile(r"<VirtualHost\b([^>]*)>(.*?)</VirtualHost>", re.I | re.S)
+APACHE_NAME_RE = re.compile(r"(?mi)^\s*ServerName\s+(.+?)\s*$")
+APACHE_ALIAS_RE = re.compile(r"(?mi)^\s*ServerAlias\s+(.+?)\s*$")
+APACHE_ROOT_RE = re.compile(r"(?mi)^\s*DocumentRoot\s+\"?([^\"\r\n]+)\"?\s*$")
+
+WORDPRESS_PATH_RE = re.compile(r"/(?:wp-login\.php|wp-admin(?:/|$))", re.I)
+NEXTCLOUD_PATH_RE = re.compile(r"/(?:index\.php/)?(?:login|settings/admin)(?:/|\?|$)", re.I)
+PHPMYADMIN_PATH_RE = re.compile(r"/(?:phpmyadmin|pma)(?:/|$)", re.I)
+GENERIC_ADMIN_PATH_RE = re.compile(r"/(?:administrator|admin)(?:/|$)", re.I)
+
+SSH_SUCCESS_TEXT = "Anmeldung erfolgreich"
 
 
-@dataclass(slots=True)
-class Website:
-    domain: str
-    aliases: list[str]
-    status: str
-    server: str
-    source: str
-    listen: list[str]
-    urls: list[str]
-    document_root: str = ""
-    application: str = ""
-    proxy_pass: list[str] | None = None
-    fastcgi_pass: list[str] | None = None
-    access_log: str = ""
-    error_log: str = ""
-    tls_certificate: str = ""
-    evidence: str = "Konfiguriert"
+@dataclass
+class ServerScanResult:
+    linux_root: str = ""
+    websites: list[dict[str, Any]] = field(default_factory=list)
+    services: list[dict[str, Any]] = field(default_factory=list)
+    admin_accesses: list[dict[str, Any]] = field(default_factory=list)
+    mail_servers: list[dict[str, Any]] = field(default_factory=list)
+    mail_accounts: list[dict[str, Any]] = field(default_factory=list)
+    mail_aliases: list[dict[str, Any]] = field(default_factory=list)
+    mail_accesses: list[dict[str, Any]] = field(default_factory=list)
+    mail_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    tls_certificates: list[dict[str, Any]] = field(default_factory=list)
+    operator_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    scan_notes: list[str] = field(default_factory=list)
+    access_log_files: list[str] = field(default_factory=list)
+    mail_log_files: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
-class ServiceFinding:
-    service: str
-    state: str
-    evidence: str
-    source: str
-    details: str = ""
-
-
-@dataclass(slots=True)
-class AdminAccess:
-    timestamp: str
-    ip: str
-    application: str
-    method: str
-    path: str
-    status: int
-    assessment: str
-    source: str
-    ssh_correlated: bool = False
-    user_agent: str = ""
-
-
-@dataclass(slots=True)
-class TLSFinding:
-    source: str
-    subject: str
-    issuer: str
-    serial: str
-    not_before: str
-    not_after: str
-    domains: list[str]
-
-
-@dataclass(slots=True)
-class OperatorArtifact:
-    kind: str
-    identity: str
-    value: str
-    source: str
-    assessment: str = "Hinweis"
-
-
-def safe_read_text(path: Path, max_bytes: int = 8 * 1024 * 1024) -> str:
+def detect_linux_root(source: Path) -> Path | None:
+    """Best-effort detection of an extracted/mounted Linux root directory."""
     try:
-        with path.open("rb") as fh:
-            data = fh.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            data = data[:max_bytes]
-        return data.decode("utf-8", errors="replace")
-    except (OSError, ValueError):
-        return ""
-
-
-def _is_probable_symlink_text(text: str) -> str | None:
-    stripped = text.strip().replace("\\", "/")
-    if not stripped or "\n" in stripped or "\r" in stripped or len(stripped) > 4096:
-        return None
-    if stripped.startswith(("../", "./", "/")) or "/sites-available/" in stripped or "/archive/" in stripped:
-        return stripped
+        source = source.resolve()
+    except OSError:
+        pass
+    start = source.parent if source.is_file() else source
+    candidates = [start] + list(start.parents[:8])
+    for candidate in candidates:
+        if (candidate / "etc").is_dir() and (candidate / "var").is_dir():
+            return candidate
     return None
 
 
-def linux_to_host(root: Path, linux_path: str, base: Path | None = None) -> Path:
-    p = linux_path.strip().strip('"\'')
-    if p.startswith("/"):
-        return root / p.lstrip("/")
-    return (base or root) / p
-
-
-def resolve_evidence_path(root: Path, path: Path, max_hops: int = 8) -> tuple[Path, str]:
-    """Resolve real symlinks and common forensic-export symlink representations."""
-    current = path
-    method = "direkt"
-    seen: set[str] = set()
-    for _ in range(max_hops):
-        key = str(current)
-        if key in seen:
-            break
-        seen.add(key)
-        try:
-            if current.is_symlink():
-                target = os.readlink(current)
-                current = linux_to_host(root, target, current.parent)
-                method = "Symlink"
-                continue
-        except OSError:
-            pass
-        if current.is_file():
-            text = safe_read_text(current, 4096)
-            target = _is_probable_symlink_text(text)
-            if target:
-                candidate = linux_to_host(root, target, current.parent)
-                if candidate.exists():
-                    current = candidate
-                    method = "Symlink-Text"
-                    continue
-        break
-    return current, method
-
-
-def rel_source(root: Path, path: Path) -> str:
+def _read_text(path: Path, limit: int = MAX_CONFIG_FILE) -> str:
     try:
-        return "/" + str(path.resolve(strict=False).relative_to(root.resolve(strict=False))).replace("\\", "/")
+        if path.stat().st_size > limit:
+            return path.read_bytes()[:limit].decode("utf-8", errors="replace")
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, PermissionError):
+        return ""
+
+
+def _safe_rel(root: Path, path: Path) -> str:
+    try:
+        return "/" + path.relative_to(root).as_posix()
     except Exception:
-        try:
-            return "/" + str(path.relative_to(root)).replace("\\", "/")
-        except Exception:
-            return str(path)
+        return str(path)
 
 
-def redact(text: str) -> str:
-    out = text
-    for key in SECRET_KEYWORDS:
-        out = re.sub(rf"(?i)({re.escape(key)}\s*[:=]\s*)([^\s;]+)", r"\1[REDACTED]", out)
-    out = re.sub(r"(?i)(https?://[^:/\s]+:)([^@/\s]+)(@)", r"\1[REDACTED]\3", out)
-    return out
+def _linux_to_host_path(root: Path, linux_path: str) -> Path:
+    cleaned = linux_path.strip().strip('"\'').split()[0]
+    if cleaned.startswith("/"):
+        cleaned = cleaned[1:]
+    return root / cleaned
 
 
-def _balanced_blocks(text: str, keyword: str) -> list[tuple[int, int, str]]:
-    blocks: list[tuple[int, int, str]] = []
-    rx = re.compile(rf"\b{re.escape(keyword)}\s*\{{")
-    for match in rx.finditer(text):
-        brace = text.find("{", match.start())
+def _strip_nginx_comments(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        # Good enough for nginx config: '#' starts comments outside quoted URLs in normal configs.
+        if "#" in line:
+            line = line.split("#", 1)[0]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _brace_blocks(text: str, keyword: str) -> list[str]:
+    blocks: list[str] = []
+    token = re.compile(rf"\b{re.escape(keyword)}\s*\{{", re.I)
+    for match in token.finditer(text):
+        open_pos = text.find("{", match.start())
+        if open_pos < 0:
+            continue
         depth = 0
-        quote: str | None = None
-        escape = False
-        for i in range(brace, len(text)):
+        in_quote: str | None = None
+        escaped = False
+        for i in range(open_pos, len(text)):
             ch = text[i]
-            if quote:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == quote:
-                    quote = None
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if in_quote:
+                if ch == in_quote:
+                    in_quote = None
                 continue
             if ch in ("'", '"'):
-                quote = ch
-            elif ch == "{":
+                in_quote = ch
+                continue
+            if ch == "{":
                 depth += 1
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    blocks.append((match.start(), i + 1, text[brace + 1:i]))
+                    blocks.append(text[match.start():i + 1])
                     break
     return blocks
 
 
-def _strip_comments(text: str) -> str:
-    lines = []
-    for line in text.splitlines():
-        out = []
-        quote: str | None = None
-        escaped = False
-        for ch in line:
-            if quote:
-                out.append(ch)
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == quote:
-                    quote = None
-            else:
-                if ch in ("'", '"'):
-                    quote = ch
-                    out.append(ch)
-                elif ch == "#":
-                    break
-                else:
-                    out.append(ch)
-        lines.append("".join(out))
-    return "\n".join(lines)
-
-
-def _directive_values(text: str, name: str) -> list[str]:
-    vals: list[str] = []
-    for m in re.finditer(rf"(?is)(?<![\w-]){re.escape(name)}\s+([^;{{}}]+);", text):
-        vals.extend(x for x in re.split(r"\s+", m.group(1).strip()) if x)
-    return vals
-
-
-def _expand_glob(root: Path, base: Path, token: str) -> list[Path]:
-    token = token.strip().strip('"\'')
-    host = linux_to_host(root, token, base)
-    if any(c in str(host) for c in "*?["):
-        parent = Path(str(host).split("*")[0]).parent
-        # pathlib glob with absolute patterns is awkward; use fnmatch over nearby tree.
-        anchor = root if str(host).startswith(str(root)) else base
-        pattern = str(host).replace("\\", "/")
-        found: list[Path] = []
-        try:
-            for p in anchor.rglob("*"):
-                if p.is_file() and fnmatch.fnmatch(str(p).replace("\\", "/"), pattern):
-                    found.append(p)
-        except OSError:
-            pass
-        return sorted(found)
-    return [host]
-
-
-def _nginx_include_chain(root: Path) -> tuple[set[Path], dict[str, int]]:
-    nginx = root / "etc/nginx"
-    queue: list[Path] = [nginx / "nginx.conf"]
-    seen: set[Path] = set()
-    diag = {
-        "sites_enabled_entries": 0,
-        "sites_enabled_direct": 0,
-        "sites_enabled_symlink": 0,
-        "sites_enabled_textlink": 0,
-        "sites_enabled_available_fallback": 0,
-        "sites_enabled_unreadable": 0,
-        "active_config_files": 0,
-        "all_nginx_files": 0,
-    }
-
-    enabled = nginx / "sites-enabled"
-    available = nginx / "sites-available"
-    if enabled.is_dir():
-        try:
-            entries = list(enabled.iterdir())
-        except OSError:
-            entries = []
-        diag["sites_enabled_entries"] = len(entries)
-        for entry in entries:
-            resolved, method = resolve_evidence_path(root, entry)
-            if resolved.is_file():
-                queue.append(resolved)
-                if method == "Symlink":
-                    diag["sites_enabled_symlink"] += 1
-                elif method == "Symlink-Text":
-                    diag["sites_enabled_textlink"] += 1
-                else:
-                    diag["sites_enabled_direct"] += 1
-            else:
-                fallback = available / entry.name
-                if fallback.is_file():
-                    queue.append(fallback)
-                    diag["sites_enabled_available_fallback"] += 1
-                else:
-                    diag["sites_enabled_unreadable"] += 1
-
-    while queue:
-        raw = queue.pop(0)
-        resolved, _ = resolve_evidence_path(root, raw)
-        try:
-            key = resolved.resolve(strict=False)
-        except OSError:
-            key = resolved
-        if key in seen or not resolved.is_file():
-            continue
-        seen.add(key)
-        text = _strip_comments(safe_read_text(resolved))
-        for m in re.finditer(r"(?is)(?<![\w-])include\s+([^;{}]+);", text):
-            for inc in _expand_glob(root, resolved.parent, m.group(1)):
-                r, _ = resolve_evidence_path(root, inc)
-                if r.is_file():
-                    queue.append(r)
-    diag["active_config_files"] = len(seen)
-    try:
-        diag["all_nginx_files"] = sum(1 for p in nginx.rglob("*") if p.is_file() or p.is_symlink()) if nginx.exists() else 0
-    except OSError:
-        pass
-    return seen, diag
-
-
-def _all_nginx_candidates(root: Path) -> list[tuple[Path, str]]:
-    nginx = root / "etc/nginx"
-    found: dict[str, tuple[Path, str]] = {}
-    if nginx.exists():
-        try:
-            for p in nginx.rglob("*"):
-                if p.is_file() or p.is_symlink():
-                    resolved, method = resolve_evidence_path(root, p)
-                    source = p
-                    if resolved.is_file():
-                        found[str(resolved.resolve(strict=False))] = (resolved, method)
-                    elif p.parent.name in {"sites-enabled", "sites-available"}:
-                        found[str(p)] = (p, "unlesbar")
-        except OSError:
-            pass
-    plesk = root / "var/www/vhosts/system"
-    if plesk.exists():
-        try:
-            for p in plesk.rglob("conf/*"):
-                if p.is_file():
-                    found[str(p.resolve(strict=False))] = (p, "Plesk")
-        except OSError:
-            pass
-    return sorted(found.values(), key=lambda x: str(x[0]).casefold())
-
-
-def _application_from_root(root: Path, docroot: str) -> str:
-    if not docroot:
+def _app_for_root(root: Path, linux_docroot: str) -> str:
+    if not linux_docroot:
         return ""
-    p = linux_to_host(root, docroot)
-    if (p / "wp-config.php").is_file() or (p / "wp-admin").is_dir():
+    host = _linux_to_host_path(root, linux_docroot)
+    if (host / "wp-config.php").is_file() or (host / "wp-includes" / "version.php").is_file():
         return "WordPress"
-    if (p / "config/config.php").is_file() and (p / "occ").exists():
+    if (host / "occ").is_file() and (host / "config" / "config.php").is_file():
         return "Nextcloud"
-    if (p / "configuration.php").is_file() and (p / "administrator").is_dir():
-        return "Joomla"
     return ""
 
 
-def analyze_nginx(root: Path) -> tuple[list[dict], dict[str, int]]:
-    active_files, diag = _nginx_include_chain(root)
-    active_str = {str(p.resolve(strict=False)).casefold() for p in active_files}
-    websites: list[Website] = []
-    seen_key: set[tuple[str, str, str]] = set()
 
-    for file_path, method in _all_nginx_candidates(root):
-        text = _strip_comments(safe_read_text(file_path)) if file_path.is_file() else ""
-        path_norm = str(file_path.resolve(strict=False)).casefold() if file_path.exists() else str(file_path).casefold()
-        active = path_norm in active_str or "sites-enabled" in str(file_path).replace("\\", "/")
-        status = "aktiv eingebunden" if active else "Konfiguration vorhanden"
-        source = rel_source(root, file_path)
-        blocks = _balanced_blocks(text, "server") if text else []
-        if not blocks and text:
-            # Recovery path for malformed/truncated configurations.
-            blocks = [(0, len(text), text)] if re.search(r"\bserver_name\b", text) else []
 
-        for _start, _end, block in blocks:
-            # Resolve includes located inside the server block (common for Plesk/snippets).
-            expanded = block
-            for inc in re.findall(r"(?is)(?<![\w-])include\s+([^;{}]+);", block):
-                for p in _expand_glob(root, file_path.parent, inc):
-                    rp, _ = resolve_evidence_path(root, p)
-                    if rp.is_file():
-                        expanded += "\n" + _strip_comments(safe_read_text(rp))
+def _website_status(path: Path) -> str:
+    p = path.as_posix().casefold()
+    if "/sites-enabled/" in p:
+        return "aktiv konfiguriert (sites-enabled)"
+    if "/sites-available/" in p:
+        return "Konfiguration vorhanden (sites-available)"
+    if "/var/www/vhosts/system/" in p:
+        return "Plesk-VHost-Konfiguration"
+    if "/conf.d/" in p:
+        return "Konfiguration in conf.d"
+    return "Webserver-Konfiguration"
 
-            names = [n for n in _directive_values(expanded, "server_name") if n not in {"_", "localhost"} and "$" not in n]
-            domains: list[str] = []
-            for name in names:
-                domains.extend(DOMAIN_RE.findall(name))
-            domains = list(dict.fromkeys(d.lower().rstrip(".") for d in domains))
-            if not domains:
-                # Plesk path can be authoritative enough to preserve a configured vhost.
-                parts = str(file_path).replace("\\", "/").split("/var/www/vhosts/system/")
-                if len(parts) > 1:
-                    d = parts[1].split("/", 1)[0]
-                    if DOMAIN_RE.fullmatch(d):
-                        domains = [d.lower()]
-            if not domains:
-                name = file_path.name.lower()
-                if DOMAIN_RE.fullmatch(name) and file_path.parent.name in {"sites-enabled", "sites-available"}:
-                    domains = [name]
-                    status = "aktiver Dateinamen-Hinweis" if file_path.parent.name == "sites-enabled" else "Dateinamen-Hinweis"
-            if not domains:
-                continue
 
-            listens = _directive_values(expanded, "listen")
-            roots = _directive_values(expanded, "root")
-            proxies = _directive_values(expanded, "proxy_pass")
-            fastcgi = _directive_values(expanded, "fastcgi_pass")
-            access = _directive_values(expanded, "access_log")
-            error = _directive_values(expanded, "error_log")
-            certs = _directive_values(expanded, "ssl_certificate")
-            primary = domains[0]
-            aliases = [x for x in domains[1:] if x != primary]
-            scheme_https = any("443" in x or "ssl" in x for x in listens) or bool(certs)
-            scheme_http = any("80" in x and "808" not in x for x in listens) or not scheme_https
-            urls = []
-            if scheme_http:
-                urls.append(f"http://{primary}/")
-            if scheme_https:
-                urls.append(f"https://{primary}/")
-            docroot = roots[0] if roots else ""
-            app = _application_from_root(root, docroot)
-            key = (primary, source, "|".join(listens))
-            if key in seen_key:
-                continue
-            seen_key.add(key)
-            websites.append(
-                Website(
-                    domain=primary,
-                    aliases=aliases,
-                    status=status,
-                    server="NGINX",
-                    source=source,
-                    listen=listens,
-                    urls=urls,
-                    document_root=docroot,
-                    application=app,
-                    proxy_pass=proxies,
-                    fastcgi_pass=fastcgi,
-                    access_log=access[0] if access else "",
-                    error_log=error[0] if error else "",
-                    tls_certificate=certs[0] if certs else "",
-                    evidence="Belegt" if active else "Konfiguriert",
-                )
-            )
+def _config_priority(path: Path) -> tuple[int, str]:
+    p = path.as_posix().casefold()
+    if "/sites-enabled/" in p:
+        rank = 0
+    elif "/var/www/vhosts/system/" in p or "/conf.d/" in p:
+        rank = 1
+    elif "/sites-available/" in p:
+        rank = 3
+    else:
+        rank = 2
+    return rank, str(path)
 
-    # Last-resort preservation of visible sites-enabled names even when the mount cannot read them.
-    enabled = root / "etc/nginx/sites-enabled"
-    if enabled.is_dir():
+
+def _rooted_symlink_target(root: Path, path: Path, max_depth: int = 8) -> Path:
+    current = path
+    for _ in range(max_depth):
         try:
-            for p in enabled.iterdir():
-                name = p.name.lower()
-                if DOMAIN_RE.fullmatch(name) and not any(w.domain == name for w in websites):
-                    websites.append(
-                        Website(
-                            domain=name,
-                            aliases=[],
-                            status="sites-enabled: Inhalt nicht lesbar",
-                            server="NGINX",
-                            source=rel_source(root, p),
-                            listen=[],
-                            urls=[f"http://{name}/", f"https://{name}/"],
-                            evidence="Hinweis",
-                        )
-                    )
+            if not current.is_symlink():
+                return current
+            target = os.readlink(current)
         except OSError:
-            pass
+            return current
+        if os.path.isabs(target):
+            current = root / target.lstrip("/\\")
+        else:
+            current = current.parent / target
+        current = Path(os.path.normpath(str(current)))
+    return current
 
-    websites.sort(key=lambda w: (w.domain, w.source))
-    return [asdict(w) for w in websites], diag
 
-
-def analyze_apache(root: Path) -> list[dict]:
-    candidates: list[tuple[Path, bool]] = []
-    for rel, active in (("etc/apache2/sites-enabled", True), ("etc/apache2/sites-available", False), ("etc/httpd/conf.d", True)):
-        base = root / rel
-        if not base.exists():
-            continue
-        try:
-            for p in base.iterdir():
-                rp, _ = resolve_evidence_path(root, p)
-                if rp.is_file():
-                    candidates.append((rp, active))
-        except OSError:
-            pass
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for path, active in candidates:
-        text = _strip_comments(safe_read_text(path))
-        blocks = _balanced_blocks(text.replace("<VirtualHost", "server {").replace("</VirtualHost>", "}"), "server")
-        if not blocks:
-            blocks = [(0, len(text), text)]
-        for _, _, block in blocks:
-            m = re.search(r"(?im)^\s*ServerName\s+(\S+)", block)
-            if not m:
+def _nginx_include_candidates(root: Path, current_file: Path, pattern: str) -> list[Path]:
+    """Resolve nginx include directives against an extracted Linux root."""
+    pattern = pattern.strip().strip('"\'')
+    if not pattern or "$" in pattern:
+        return []
+    host_patterns: list[Path] = []
+    if pattern.startswith("/"):
+        host_patterns.append(root / pattern.lstrip("/"))
+    else:
+        # Be liberal: packaged nginx configs are often easiest to reconstruct
+        # relative to /etc/nginx, while custom setups may use file-relative paths.
+        host_patterns.append(current_file.parent / pattern)
+        host_patterns.append(root / "etc/nginx" / pattern)
+    found: list[Path] = []
+    for host_pattern in host_patterns:
+        for value in glob.glob(str(host_pattern)):
+            path = Path(value)
+            try:
+                path.lstat()
+            except OSError:
                 continue
-            domain_match = DOMAIN_RE.search(m.group(1))
-            if not domain_match:
+            if path.is_dir():
                 continue
-            domain = domain_match.group(0).lower()
-            aliases = []
-            for am in re.finditer(r"(?im)^\s*ServerAlias\s+(.+)$", block):
-                aliases.extend(DOMAIN_RE.findall(am.group(1)))
-            root_m = re.search(r"(?im)^\s*DocumentRoot\s+\"?([^\"\s]+)", block)
-            key = (domain, rel_source(root, path))
-            if key in seen:
-                continue
-            seen.add(key)
-            docroot = root_m.group(1) if root_m else ""
-            out.append(
-                asdict(
-                    Website(
-                        domain=domain,
-                        aliases=list(dict.fromkeys(a.lower() for a in aliases)),
-                        status="aktiv eingebunden" if active else "Konfiguration vorhanden",
-                        server="Apache",
-                        source=rel_source(root, path),
-                        listen=[],
-                        urls=[f"http://{domain}/", f"https://{domain}/"],
-                        document_root=docroot,
-                        application=_application_from_root(root, docroot),
-                        evidence="Belegt" if active else "Konfiguriert",
-                    )
-                )
-            )
-    return out
+            found.append(path)
+    return list(dict.fromkeys(found))
 
 
-def extract_successful_ssh(journal_events: Iterable[dict[str, str]]) -> list[dict]:
-    rx = re.compile(
-        r"Accepted\s+(?P<method>publickey|password|keyboard-interactive/pam|keyboard-interactive)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>[0-9a-fA-F:.]+)\s+port\s+(?P<port>\d+)",
-        re.I,
-    )
-    out: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
-    for e in journal_events:
-        msg = e.get("MESSAGE", "")
-        m = rx.search(msg)
-        if not m:
-            continue
-        ts = e.get("__DATETIME_UTC") or _timestamp_from_micro(e.get("__REALTIME_TIMESTAMP", ""))
-        item = {
-            "timestamp": ts,
-            "user": m.group("user"),
-            "ip": m.group("ip"),
-            "port": m.group("port"),
-            "method": m.group("method"),
-            "source": e.get("__SOURCE_FILE", ""),
-            "cursor": e.get("__CURSOR", ""),
-            "message": msg,
-        }
-        key = (ts, item["user"], item["ip"])
-        if key not in seen:
-            seen.add(key)
-            out.append(item)
-    out.sort(key=lambda x: x["timestamp"])
-    return out
+def _nginx_file_key(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
 
 
-def _timestamp_from_micro(value: str) -> str:
+def _nginx_plaintext_link_target(root: Path, path: Path) -> Path | None:
+    """Resolve a symlink that a Windows forensic export exposed as a tiny text file.
+
+    Some image/mount tools do not expose Linux symbolic links as Windows reparse
+    points. Instead the directory entry is visible, but opening it yields only the
+    original Linux link target (for example ``../sites-available/shop.example``).
+    Treat only very small, single-line, path-looking files as such a surrogate.
+    """
     try:
-        return datetime.fromtimestamp(int(value) / 1_000_000, tz=timezone.utc).isoformat()
-    except Exception:
-        return ""
-
-
-def _parse_access_time(value: str) -> datetime | None:
-    for fmt in ("%d/%b/%Y:%H:%M:%S %z", "%d/%b/%Y:%H:%M:%S"):
-        try:
-            dt = datetime.strptime(value, fmt)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        if size <= 0 or size > 4096:
+            return None
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        text = raw.decode("utf-8", errors="strict").strip().strip("\x00")
+    except UnicodeDecodeError:
+        return None
+    if not text or "\n" in text or "\r" in text or any(ch in text for ch in "{};"):
+        return None
+    # Be conservative so an ordinary one-line nginx config is not mistaken for a link.
+    if not (text.startswith(("/", "../", "./")) or "/sites-available/" in text.replace("\\", "/")):
+        return None
+    target_text = text.replace("\\", "/")
+    if target_text.startswith("/"):
+        candidate = root / target_text.lstrip("/")
+    else:
+        candidate = Path(os.path.normpath(str(path.parent / target_text)))
+    try:
+        if candidate.is_file() and candidate.stat().st_size <= MAX_CONFIG_FILE:
+            return candidate
+    except OSError:
+        return None
     return None
 
 
-def discover_access_logs(root: Path) -> list[Path]:
-    patterns = [
-        "var/log/nginx/*access*.log*",
-        "var/log/apache2/*access*.log*",
-        "var/log/httpd/*access*",
-        "var/log/plesk/httpsd_access_log*",
-        "var/log/sw-cp-server/access.log*",
-        "var/www/vhosts/system/*/logs/access_log*",
-        "var/www/vhosts/system/*/logs/proxy_access_log*",
-    ]
-    out: set[Path] = set()
-    for pattern in patterns:
-        parts = pattern.split("/")
-        base = root
-        # pathlib glob relative to root works with globs.
-        try:
-            for p in root.glob(pattern):
-                if p.is_file():
-                    out.add(p)
-        except OSError:
-            continue
-    return sorted(out, key=lambda p: str(p).casefold())
+def _nginx_resolve_readable_file(root: Path, path: Path) -> tuple[Path | None, str]:
+    """Resolve a nginx config entry and describe how it became readable.
 
-
-ADMIN_RULES = [
-    ("WordPress", re.compile(r"(?i)^/wp-login\.php(?:[/?]|$)"), re.compile(r"(?i)^/wp-admin(?:[/?]|$)")),
-    ("Plesk", re.compile(r"(?i)(?:^|/)login_up\.php|^/login(?:[/?]|$)"), re.compile(r"(?i)^/(?:smb|admin|modules|plesk|webmail)(?:[/?]|$)")),
-    ("phpMyAdmin", re.compile(r"(?i)/(?:phpmyadmin|pma)(?:/|$)"), re.compile(r"(?i)/(?:phpmyadmin|pma)(?:/|$)")),
-    ("Nextcloud", re.compile(r"(?i)^/(?:index\.php/)?login(?:[/?]|$)"), re.compile(r"(?i)^/(?:index\.php/)?(?:apps|settings|ocs|remote)(?:[/?]|$)")),
-]
-
-
-def analyze_admin_access(root: Path, ssh_logins: list[dict]) -> list[dict]:
-    ssh_ips = {x.get("ip", "") for x in ssh_logins}
-    records: list[tuple[datetime | None, dict]] = []
-    raw_hits: list[dict] = []
-    for path in discover_access_logs(root):
-        text = safe_read_text(path, 64 * 1024 * 1024)
-        for line in text.splitlines():
-            m = LOG_RE.match(line)
-            if not m:
-                continue
-            req_path = m.group("path")
-            app = ""
-            login = False
-            protected = False
-            for name, login_rx, protected_rx in ADMIN_RULES:
-                if login_rx.search(req_path):
-                    app, login = name, True
-                    break
-                if protected_rx.search(req_path):
-                    app, protected = name, True
-                    break
-            if not app:
-                continue
-            dt = _parse_access_time(m.group("time"))
-            raw_hits.append(
-                {
-                    "dt": dt,
-                    "timestamp": dt.isoformat() if dt else m.group("time"),
-                    "ip": m.group("ip"),
-                    "application": app,
-                    "method": m.group("method"),
-                    "path": req_path,
-                    "status": int(m.group("status")),
-                    "login": login,
-                    "protected": protected,
-                    "source": rel_source(root, path),
-                    "ua": m.group("ua") or "",
-                }
-            )
-
-    by_ip_app: dict[tuple[str, str], list[dict]] = {}
-    for hit in raw_hits:
-        by_ip_app.setdefault((hit["ip"], hit["application"]), []).append(hit)
-    for group in by_ip_app.values():
-        group.sort(key=lambda h: h["dt"] or datetime.min.replace(tzinfo=timezone.utc))
-
-    out: list[dict] = []
-    for hit in raw_hits:
-        status = hit["status"]
-        assessment = "Zugriffsversuch"
-        if hit["login"] and hit["method"] == "POST" and 200 <= status < 400:
-            strong = False
-            if hit["dt"]:
-                for other in by_ip_app[(hit["ip"], hit["application"])]:
-                    if not other["protected"] or not other["dt"]:
-                        continue
-                    delta = other["dt"] - hit["dt"]
-                    if timedelta(seconds=0) <= delta <= timedelta(minutes=10) and 200 <= other["status"] < 400:
-                        strong = True
-                        break
-            assessment = "Starker Hinweis auf erfolgreiche Anmeldung" if strong else "Login-POST akzeptiert/weitergeleitet"
-        elif hit["protected"] and 200 <= status < 400:
-            assessment = "Zugriff auf geschützten/Adminbereich"
-        elif status in (401, 403):
-            assessment = "Abgewiesener Zugriff"
-        elif status >= 400:
-            assessment = "Fehlgeschlagener/technischer Zugriff"
-        out.append(
-            asdict(
-                AdminAccess(
-                    timestamp=hit["timestamp"],
-                    ip=hit["ip"],
-                    application=hit["application"],
-                    method=hit["method"],
-                    path=hit["path"],
-                    status=status,
-                    assessment=assessment,
-                    source=hit["source"],
-                    ssh_correlated=hit["ip"] in ssh_ips,
-                    user_agent=hit["ua"],
-                )
-            )
-        )
-    out.sort(key=lambda x: x["timestamp"])
-    return out
-
-
-def analyze_tls(root: Path) -> list[dict]:
+    The fallback to a same-named file in ``sites-available`` is intentional: many
+    Windows forensic mounts show the Linux symlink entry in ``sites-enabled`` but
+    do not permit Python to follow it as a native Windows symlink.
+    """
     try:
-        from cryptography import x509
-    except ImportError:
-        return []
-    candidates: set[Path] = set()
-    for rel in ("etc/letsencrypt/live", "etc/letsencrypt/archive", "etc/ssl", "var/www/vhosts/system"):
-        base = root / rel
-        if not base.exists():
-            continue
+        if path.is_symlink():
+            actual = _rooted_symlink_target(root, path)
+            try:
+                if actual.is_file() and actual.stat().st_size <= MAX_CONFIG_FILE:
+                    return actual, "Linux-Symlink"
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+    # A mount/export may have converted the symlink into a regular text file that
+    # contains only the Linux link target. Resolve that before treating it as config.
+    surrogate = _nginx_plaintext_link_target(root, path)
+    if surrogate is not None:
+        return surrogate, "Symlink-Ziel als Textdatei"
+
+    try:
+        if path.is_file() and path.stat().st_size <= MAX_CONFIG_FILE:
+            size = path.stat().st_size
+            # Empty regular files in sites-enabled are sometimes how a forensic
+            # export represents an otherwise un-followable Linux symlink. Give the
+            # canonical sites-available target a chance before accepting emptiness.
+            if size > 0 or "sites-enabled" not in [part.casefold() for part in path.parts]:
+                return path, "direkt lesbare Datei"
+    except OSError:
+        pass
+
+    # Last practical Windows-forensics fallback: sites-enabled/foo normally points
+    # to sites-available/foo. Even when the mount driver cannot expose/follow the
+    # original symlink, the target is often present and readable there.
+    parts_cf = [part.casefold() for part in path.parts]
+    if "sites-enabled" in parts_cf:
         try:
-            for p in base.rglob("*"):
-                if p.suffix.lower() in {".pem", ".crt", ".cer"} and (p.is_file() or p.is_symlink()):
-                    rp, _ = resolve_evidence_path(root, p)
-                    if rp.is_file():
-                        candidates.add(rp)
-        except OSError:
+            idx = parts_cf.index("sites-enabled")
+            parts = list(path.parts)
+            parts[idx] = "sites-available"
+            sibling = Path(*parts)
+            # The target itself can again be a real Linux-style symlink.
+            actual = _rooted_symlink_target(root, sibling)
+            if actual.is_file() and actual.stat().st_size <= MAX_CONFIG_FILE:
+                return actual, "über gleichnamige sites-available-Datei rekonstruiert"
+        except (OSError, ValueError, IndexError):
             pass
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for p in sorted(candidates, key=lambda x: str(x).casefold()):
-        try:
-            data = p.read_bytes()
-            cert = x509.load_pem_x509_certificate(data) if b"BEGIN CERTIFICATE" in data else x509.load_der_x509_certificate(data)
-        except Exception:
-            continue
-        domains: list[str] = []
-        try:
-            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            domains.extend(san.value.get_values_for_type(x509.DNSName))
-        except Exception:
-            pass
-        try:
-            from cryptography.x509.oid import NameOID
-            cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-            domains.extend(a.value for a in cn if DOMAIN_RE.fullmatch(a.value))
-        except Exception:
-            pass
-        domains = list(dict.fromkeys(d.lower() for d in domains))
-        key = (str(cert.serial_number), ",".join(domains))
+
+    return None, "nicht lesbar"
+
+
+def _nginx_readable_file(root: Path, path: Path) -> Path | None:
+    """Return the actual readable file behind a Linux/forensic symlink, if any."""
+    return _nginx_resolve_readable_file(root, path)[0]
+
+
+def _discover_active_nginx_files(root: Path) -> set[str]:
+    mains = [
+        root / "etc/nginx/nginx.conf",
+        root / "usr/local/etc/nginx/nginx.conf",
+        root / "usr/local/nginx/conf/nginx.conf",
+        root / "usr/local/openresty/nginx/conf/nginx.conf",
+        root / "opt/nginx/conf/nginx.conf",
+    ]
+    queue: list[Path] = [p for p in mains if _nginx_readable_file(root, p) is not None]
+    if not queue:
+        return set()
+    active: set[str] = set()
+    seen: set[str] = set()
+    while queue and len(seen) < 20_000:
+        path = queue.pop(0)
+        key = _nginx_file_key(path)
         if key in seen:
             continue
         seen.add(key)
-        not_before = getattr(cert, "not_valid_before_utc", cert.not_valid_before.replace(tzinfo=timezone.utc)).isoformat()
-        not_after = getattr(cert, "not_valid_after_utc", cert.not_valid_after.replace(tzinfo=timezone.utc)).isoformat()
-        out.append(
-            asdict(
-                TLSFinding(
-                    source=rel_source(root, p),
-                    subject=cert.subject.rfc4514_string(),
-                    issuer=cert.issuer.rfc4514_string(),
-                    serial=f"{cert.serial_number:x}",
-                    not_before=not_before,
-                    not_after=not_after,
-                    domains=domains,
+        active.add(key)
+        actual = _nginx_readable_file(root, path)
+        if actual is None:
+            continue
+        active.add(_nginx_file_key(actual))
+        text = _strip_nginx_comments(_read_text(actual))
+        if not text:
+            continue
+        for match in NGINX_INCLUDE_RE.finditer(text):
+            for candidate in _nginx_include_candidates(root, path, match.group(1)):
+                queue.append(candidate)
+    return active
+
+
+def _expand_nginx_file(
+    root: Path,
+    path: Path,
+    *,
+    depth: int = 0,
+    stack: set[str] | None = None,
+    max_depth: int = 20,
+) -> str:
+    """Best-effort expansion of nginx include directives for forensic parsing."""
+    if depth > max_depth:
+        return ""
+    stack = set() if stack is None else set(stack)
+    key = _nginx_file_key(path)
+    if key in stack:
+        return ""
+    stack.add(key)
+    actual = _nginx_readable_file(root, path)
+    if actual is None:
+        return ""
+    text = _strip_nginx_comments(_read_text(actual))
+    if not text:
+        return ""
+
+    parts: list[str] = []
+    last = 0
+    for match in NGINX_INCLUDE_RE.finditer(text):
+        parts.append(text[last:match.start()])
+        candidates = _nginx_include_candidates(root, path, match.group(1))
+        if candidates:
+            for candidate in candidates:
+                expanded = _expand_nginx_file(
+                    root, candidate, depth=depth + 1, stack=stack, max_depth=max_depth
                 )
-            )
-        )
-    return out
+                if expanded:
+                    parts.append("\n/* K25 expanded include: " + _safe_rel(root, candidate) + " */\n")
+                    parts.append(expanded)
+                    parts.append("\n/* K25 end include */\n")
+        else:
+            parts.append(match.group(0))
+        last = match.end()
+    parts.append(text[last:])
+    return "".join(parts)
 
 
-def analyze_services(root: Path, journal_events: Iterable[dict[str, str]]) -> list[dict]:
-    checks = [
-        ("OpenSSH", ["etc/ssh/sshd_config", "usr/sbin/sshd"], ["sshd.service", "ssh.service"]),
-        ("NGINX", ["etc/nginx/nginx.conf"], ["nginx.service"]),
-        ("Apache", ["etc/apache2/apache2.conf", "etc/httpd/conf/httpd.conf"], ["apache2.service", "httpd.service"]),
-        ("PHP-FPM", ["etc/php", "etc/php-fpm.conf"], ["php", "php-fpm"]),
-        ("Plesk", ["etc/psa/psa.conf", "usr/local/psa"], ["psa.service", "sw-cp-server.service"]),
-        ("Postfix", ["etc/postfix/main.cf"], ["postfix.service"]),
-        ("Exim", ["etc/exim4", "etc/exim"], ["exim4.service", "exim.service"]),
-        ("Dovecot", ["etc/dovecot/dovecot.conf"], ["dovecot.service"]),
-        ("Rspamd", ["etc/rspamd"], ["rspamd.service"]),
-        ("SpamAssassin", ["etc/spamassassin"], ["spamassassin.service", "spamd.service"]),
-        ("TeamSpeak", ["opt/teamspeak", "var/lib/teamspeak"], ["teamspeak.service", "ts3server.service"]),
-        ("Nextcloud", ["var/www/nextcloud", "opt/nextcloud"], []),
-        ("Docker", ["var/lib/docker", "etc/docker"], ["docker.service"]),
-        ("Podman", ["var/lib/containers", "etc/containers"], ["podman.service"]),
-        ("MariaDB/MySQL", ["var/lib/mysql", "etc/mysql"], ["mariadb.service", "mysql.service"]),
-        ("PostgreSQL", ["var/lib/postgresql", "etc/postgresql"], ["postgresql.service"]),
-        ("Redis", ["etc/redis", "var/lib/redis"], ["redis.service", "redis-server.service"]),
-        ("Fail2ban", ["etc/fail2ban"], ["fail2ban.service"]),
-        ("WireGuard", ["etc/wireguard"], ["wg-quick@"]),
-        ("OpenVPN", ["etc/openvpn"], ["openvpn.service", "openvpn-server@"]),
-        ("vsftpd", ["etc/vsftpd.conf"], ["vsftpd.service"]),
-        ("ProFTPD", ["etc/proftpd"], ["proftpd.service"]),
+def _discover_nginx_inventory_files(root: Path, active_files: set[str]) -> list[Path]:
+    """Collect nginx candidates without relying on filename suffixes.
+
+    A very common sites-available file name is the domain itself, for example
+    ``shop.example.de``.  Path.suffix sees ``.de`` as an extension, so filtering
+    for ``.conf`` accidentally drops genuine vhosts.
+
+    ``sites-enabled`` and ``sites-available`` are enumerated explicitly first.
+    This matters on Windows forensic mounts where Linux symlink entries can be
+    visible in Explorer but fail normal ``Path.is_file()`` checks.
+    """
+    found: list[Path] = []
+
+    for direct_dir in (root / "etc/nginx/sites-enabled", root / "etc/nginx/sites-available"):
+        try:
+            with os.scandir(direct_dir) as entries:
+                for entry in entries:
+                    if entry.name in {".", ".."}:
+                        continue
+                    candidate = Path(entry.path)
+                    # Do not require stat/is_file here: special/symlink entries from
+                    # forensic mount drivers are precisely what we need to retain.
+                    found.append(candidate)
+        except OSError:
+            pass
+
+    nginx_roots = [
+        root / "etc/nginx",
+        root / "usr/local/etc/nginx",
+        root / "usr/local/nginx/conf",
+        root / "usr/local/openresty/nginx/conf",
+        root / "opt/nginx/conf",
     ]
-    units = set()
-    for e in journal_events:
-        for key in ("_SYSTEMD_UNIT", "UNIT"):
-            if e.get(key):
-                units.add(e[key])
-    out: list[ServiceFinding] = []
-    for name, paths, unit_tokens in checks:
-        fs_sources = [p for p in paths if (root / p).exists()]
-        unit_hits = [u for u in units if any(t in u for t in unit_tokens)] if unit_tokens else []
-        if unit_hits:
-            out.append(ServiceFinding(name, "Aktivität im Journal", "Belegt", ", ".join(unit_hits[:6]), ", ".join(fs_sources)))
-        elif fs_sources:
-            out.append(ServiceFinding(name, "Installation/Konfiguration festgestellt", "Konfiguriert", ", ".join("/" + p for p in fs_sources)))
-    # Preserve additional services seen in journal.
-    known_units = {u for f in out for u in f.source.split(", ") if u.endswith(".service")}
-    for u in sorted(x for x in units if x.endswith(".service") and x not in known_units):
-        out.append(ServiceFinding(u, "Aktivität im Journal", "Belegt", "systemd journal"))
-    return [asdict(x) for x in out]
-
-
-def _ssh_fingerprint(line: str) -> tuple[str, str, str] | None:
-    parts = line.strip().split()
-    if len(parts) < 2 or not parts[0].startswith(("ssh-", "ecdsa-")):
-        return None
-    try:
-        raw = base64.b64decode(parts[1].encode("ascii"), validate=True)
-    except Exception:
-        return None
-    fp = base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
-    comment = " ".join(parts[2:]) if len(parts) > 2 else ""
-    return parts[0], f"SHA256:{fp}", comment
-
-
-def _linux_users(root: Path) -> list[tuple[str, str]]:
-    passwd = root / "etc/passwd"
-    text = safe_read_text(passwd)
-    out: list[tuple[str, str]] = []
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
+    for nginx_root in nginx_roots:
+        if not nginx_root.is_dir():
             continue
-        parts = line.split(":")
-        if len(parts) >= 7:
-            out.append((parts[0], parts[5]))
+        try:
+            for p in nginx_root.rglob("*"):
+                try:
+                    if p.is_dir() or _nginx_readable_file(root, p) is None:
+                        continue
+                except OSError:
+                    continue
+                found.append(p)
+        except OSError:
+            pass
+
+    plesk_root = root / "var/www/vhosts/system"
+    if plesk_root.is_dir():
+        try:
+            for p in plesk_root.rglob("*"):
+                if "/conf/" not in p.as_posix():
+                    continue
+                try:
+                    if p.is_dir() or _nginx_readable_file(root, p) is None:
+                        continue
+                except OSError:
+                    continue
+                found.append(p)
+        except OSError:
+            pass
+
+    for key in active_files:
+        p = Path(key)
+        if _nginx_readable_file(root, p) is not None:
+            found.append(p)
+
+    main = root / "etc/nginx/nginx.conf"
+    if _nginx_readable_file(root, main) is not None:
+        found.append(main)
+
+    return list(dict.fromkeys(found))
+
+
+def _nginx_is_active(path: Path, active_files: set[str]) -> bool:
+    if _nginx_file_key(path) in active_files:
+        return True
+    # sites-enabled is strong evidence of intended activation even if a forensic
+    # export did not preserve the original symlink target perfectly.
+    return "/sites-enabled/" in path.as_posix().casefold()
+
+
+def _nginx_sites_diagnostics(root: Path) -> dict[str, Any]:
+    """Summarize how Windows exposes Debian-style nginx vhost directories."""
+    out: dict[str, Any] = {
+        "enabled_total": 0,
+        "available_total": 0,
+        "enabled_resolution": Counter(),
+        "available_resolution": Counter(),
+        "enabled_names": [],
+    }
+    for label, directory in (
+        ("enabled", root / "etc/nginx/sites-enabled"),
+        ("available", root / "etc/nginx/sites-available"),
+    ):
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name in {".", ".."}:
+                        continue
+                    out[f"{label}_total"] += 1
+                    path = Path(entry.path)
+                    _actual, method = _nginx_resolve_readable_file(root, path)
+                    out[f"{label}_resolution"][method] += 1
+                    if label == "enabled" and len(out["enabled_names"]) < 100:
+                        out["enabled_names"].append(entry.name)
+        except OSError:
+            continue
     return out
 
 
-def analyze_operator_artifacts(root: Path) -> list[dict]:
-    out: list[OperatorArtifact] = []
-    for user, home in _linux_users(root):
-        out.append(OperatorArtifact("Linux-Benutzer", user, home, "/etc/passwd", "Konfiguriert"))
-        home_path = linux_to_host(root, home)
-        auth = home_path / ".ssh/authorized_keys"
-        if auth.is_file():
-            for line in safe_read_text(auth).splitlines():
-                fp = _ssh_fingerprint(line)
-                if fp:
-                    keytype, fingerprint, comment = fp
-                    out.append(OperatorArtifact("SSH-Key", user, f"{keytype} {fingerprint}" + (f" ({comment})" if comment else ""), rel_source(root, auth), "Belegt"))
-        known = home_path / ".ssh/known_hosts"
-        if known.is_file():
-            count = sum(1 for line in safe_read_text(known).splitlines() if line.strip() and not line.startswith("#"))
-            out.append(OperatorArtifact("SSH known_hosts", user, f"{count} Einträge", rel_source(root, known)))
-        gitconfig = home_path / ".gitconfig"
-        if gitconfig.is_file():
-            text = safe_read_text(gitconfig)
-            name = re.search(r"(?im)^\s*name\s*=\s*(.+)$", text)
-            email = re.search(r"(?im)^\s*email\s*=\s*(.+)$", text)
-            if name or email:
-                out.append(OperatorArtifact("Git-Identität", user, redact(f"{name.group(1).strip() if name else ''} <{email.group(1).strip() if email else ''}>").strip(), rel_source(root, gitconfig), "Hinweis"))
-        for history_name in (".bash_history", ".zsh_history"):
-            hist = home_path / history_name
-            if hist.is_file():
-                lines = [redact(x.strip()) for x in safe_read_text(hist, 4 * 1024 * 1024).splitlines() if x.strip()]
-                preview = " | ".join(lines[-8:])[:2000]
-                out.append(OperatorArtifact("Shell-History", user, f"{len(lines)} Einträge; letzte Befehle: {preview}", rel_source(root, hist), "Hinweis"))
+def _nginx_names_from_block(block: str) -> list[str]:
+    names: list[str] = []
+    for m in NGINX_SERVER_NAME_RE.finditer(block):
+        for raw in m.group(1).split():
+            name = raw.strip().strip('"\'')
+            if not name or name == "_":
+                continue
+            names.append(name)
+    return list(dict.fromkeys(names))
 
-    # Git repositories and remotes in common web/service locations.
-    for base_rel in ("var/www", "srv", "opt", "home", "root"):
-        base = root / base_rel
-        if not base.exists():
-            continue
-        try:
-            for config in base.rglob(".git/config"):
-                text = safe_read_text(config)
-                remotes = re.findall(r"(?im)^\s*url\s*=\s*(.+)$", text)
-                repo = config.parent.parent
-                for remote in remotes[:8]:
-                    out.append(OperatorArtifact("Git-Remote", rel_source(root, repo), redact(remote.strip()), rel_source(root, config), "Hinweis"))
-        except OSError:
-            pass
 
-    # Cron and custom systemd services.
-    cron_paths = [root / "etc/crontab"]
-    for rel in ("etc/cron.d", "var/spool/cron", "var/spool/cron/crontabs"):
-        base = root / rel
-        if base.exists():
-            try:
-                cron_paths.extend(p for p in base.rglob("*") if p.is_file())
-            except OSError:
-                pass
-    for p in cron_paths:
-        if not p.is_file():
-            continue
-        lines = [redact(x.strip()) for x in safe_read_text(p).splitlines() if x.strip() and not x.lstrip().startswith("#")]
-        if lines:
-            out.append(OperatorArtifact("Cron", p.name, " | ".join(lines[:12])[:2500], rel_source(root, p), "Konfiguriert"))
+def _nginx_infer_plesk_domain(root: Path, path: Path) -> str:
+    try:
+        rel = path.relative_to(root / "var/www/vhosts/system")
+        if len(rel.parts) >= 2 and rel.parts[1] == "conf":
+            candidate = rel.parts[0]
+            if "." in candidate and " " not in candidate:
+                return candidate
+    except Exception:
+        pass
+    return ""
 
-    for rel in ("etc/systemd/system", "usr/lib/systemd/system", "lib/systemd/system"):
-        base = root / rel
-        if not base.exists():
+
+def _urls_from_nginx(names: list[str], listens: list[str]) -> str:
+    urls: list[str] = []
+    if not names:
+        return ""
+    endpoints: list[tuple[str, str]] = []
+    for listen in listens or ["80"]:
+        low = listen.casefold()
+        token = listen.split()[0] if listen.split() else ""
+        port = ""
+        m = re.search(r"(?::|^)(\d+)$", token.strip("[]"))
+        if m:
+            port = m.group(1)
+        elif token.isdigit():
+            port = token
+        scheme = "https" if "ssl" in low or port == "443" else "http"
+        endpoints.append((scheme, port))
+    if not endpoints:
+        endpoints = [("http", "")]
+    for name in names:
+        if name.startswith("~") or "$" in name or name.startswith("*") or name.startswith("."):
             continue
-        try:
-            for unit in base.glob("*.service"):
-                text = safe_read_text(unit)
-                if not text:
+        for scheme, port in endpoints:
+            suffix = ""
+            if port and not ((scheme == "http" and port == "80") or (scheme == "https" and port == "443")):
+                suffix = f":{port}"
+            url = f"{scheme}://{name}{suffix}"
+            if url not in urls:
+                urls.append(url)
+    return " | ".join(urls)
+
+def scan_websites(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    dedupe: set[tuple[str, ...]] = set()
+    active_nginx_files = _discover_active_nginx_files(root)
+
+    nginx_files = _discover_nginx_inventory_files(root, active_nginx_files)
+    parsed_name_sources: set[tuple[str, str]] = set()
+    parsed_names_global: set[str] = set()
+
+    for path in sorted(set(nginx_files), key=_config_priority):
+        actual_path = _nginx_readable_file(root, path)
+        if actual_path is None:
+            continue
+
+        # Expand includes so a server block can inherit server_name/root/logging
+        # directives stored in snippets.  If expansion fails, fall back to the
+        # source file itself.
+        text = _expand_nginx_file(root, path) or _strip_nginx_comments(_read_text(actual_path))
+        if not text:
+            continue
+
+        blocks = _brace_blocks(text, "server")
+        for block in blocks:
+            names = _nginx_names_from_block(block)
+            root_match = NGINX_ROOT_RE.search(block)
+            docroot = root_match.group(1).strip().strip('"\'') if root_match else ""
+            listens = [m.group(1).strip() for m in NGINX_LISTEN_RE.finditer(block)]
+            proxy_pass = [m.group(1).strip().strip('"\'') for m in NGINX_PROXY_PASS_RE.finditer(block)]
+            access_logs = [m.group(1).strip() for m in NGINX_ACCESS_LOG_RE.finditer(block)]
+            error_logs = [m.group(1).strip() for m in NGINX_ERROR_LOG_RE.finditer(block)]
+            ssl_certs = [m.group(1).strip().strip('"\'') for m in NGINX_SSL_CERT_RE.finditer(block)]
+            fastcgi = [m.group(1).strip() for m in NGINX_FASTCGI_RE.finditer(block)]
+
+            # Plesk path itself is useful corroborating evidence if the generated
+            # block delegates server_name to another include or uses variables.
+            inferred_plesk = _nginx_infer_plesk_domain(root, path)
+            if not names and inferred_plesk:
+                names = [inferred_plesk]
+
+            if not names and not docroot and not proxy_pass:
+                continue
+            domain_text = ", ".join(dict.fromkeys(names)) if names else "(kein server_name)"
+            listen_text = ", ".join(dict.fromkeys(listens))
+            proxy_text = ", ".join(dict.fromkeys(proxy_pass))
+            key = ("Nginx", domain_text, docroot, listen_text, proxy_text)
+            if key in dedupe:
+                continue
+            dedupe.add(key)
+            for name in names:
+                parsed_name_sources.add((name.casefold(), _safe_rel(root, path).casefold()))
+                parsed_names_global.add(name.casefold())
+            active = _nginx_is_active(path, active_nginx_files)
+            rows.append(
+                {
+                    "webserver": "Nginx",
+                    "domains": domain_text,
+                    "urls": _urls_from_nginx(names, listens),
+                    "document_root": docroot,
+                    "application": _app_for_root(root, docroot),
+                    "listen": listen_text,
+                    "proxy_pass": proxy_text,
+                    "fastcgi_pass": ", ".join(dict.fromkeys(fastcgi)),
+                    "access_log": " | ".join(dict.fromkeys(access_logs)),
+                    "error_log": " | ".join(dict.fromkeys(error_logs)),
+                    "ssl_certificate": " | ".join(dict.fromkeys(ssl_certs)),
+                    "active": "Ja" if active else "Nicht sicher / nur Konfigurationsfund",
+                    "source_file": _safe_rel(root, path),
+                    "status_hint": "aktiv über nginx.conf/Include-Kette eingebunden" if active else _website_status(path),
+                    "evidence": "server-Block in Nginx-Konfiguration" + ("; Includes rekonstruiert" if "K25 expanded include" in text else "") + ("; aktiv über Include-Kette" if active else ""),
+                }
+            )
+
+        # Fallback inventory: even if a server block could not be reconstructed,
+        # every literal server_name directive is valuable evidence.  This catches
+        # unusual generated configs and partially recovered files.  Mark it as a
+        # weaker config finding instead of claiming a fully parsed vhost.
+        raw_text = _strip_nginx_comments(_read_text(actual_path))
+        for m in NGINX_SERVER_NAME_RE.finditer(raw_text):
+            raw_names = []
+            for raw in m.group(1).split():
+                name = raw.strip().strip('"\'')
+                if name and name != "_":
+                    raw_names.append(name)
+            raw_names = list(dict.fromkeys(raw_names))
+            if not raw_names:
+                continue
+            active = _nginx_is_active(path, active_nginx_files)
+            for name in raw_names:
+                marker = (name.casefold(), _safe_rel(root, path).casefold())
+                if marker in parsed_name_sources or name.casefold() in parsed_names_global:
                     continue
-                execs = re.findall(r"(?im)^\s*ExecStart\s*=\s*(.+)$", text)
-                envs = re.findall(r"(?im)^\s*EnvironmentFile\s*=\s*-?(.+)$", text)
-                if execs or envs:
-                    details = "; ".join([*("ExecStart=" + redact(x) for x in execs[:3]), *("EnvironmentFile=" + x for x in envs[:3])])
-                    out.append(OperatorArtifact("systemd Service", unit.name, details, rel_source(root, unit), "Konfiguriert"))
+                fallback_key = ("Nginx-server_name", name, _safe_rel(root, path))
+                if fallback_key in dedupe:
+                    continue
+                dedupe.add(fallback_key)
+                rows.append(
+                    {
+                        "webserver": "Nginx",
+                        "domains": name,
+                        "urls": "",
+                        "document_root": "",
+                        "application": "",
+                        "listen": "",
+                        "proxy_pass": "",
+                        "fastcgi_pass": "",
+                        "access_log": "",
+                        "error_log": "",
+                        "ssl_certificate": "",
+                        "active": "Ja" if active else "Nicht sicher / nur Konfigurationsfund",
+                        "source_file": _safe_rel(root, path),
+                        "status_hint": "server_name-Fund; Datei aktiv eingebunden" if active else _website_status(path),
+                        "evidence": "server_name-Direktive in Nginx-Konfiguration; server-Block nicht vollständig rekonstruiert",
+                    }
+                )
+
+    # Last-resort clue: sites-available/sites-enabled are frequently named after
+    # the domain.  If the file name itself is a valid-looking FQDN and no
+    # server_name finding exists, retain it as a clearly labelled weak hint.
+    known_domain_tokens: set[str] = set()
+    for row in rows:
+        if row.get("webserver") != "Nginx":
+            continue
+        for token in str(row.get("domains", "")).split(","):
+            token = token.strip().casefold()
+            if token and token not in {"(kein server_name)", "(nicht ermittelt)"}:
+                known_domain_tokens.add(token)
+    for path in nginx_files:
+        posix = path.as_posix().casefold()
+        in_enabled = "/sites-enabled/" in posix
+        in_available = "/sites-available/" in posix
+        if not in_available and not in_enabled:
+            continue
+        filename = path.name
+        candidate = filename[:-5] if filename.casefold().endswith(".conf") else filename
+        candidate = candidate.strip().casefold()
+        if not NGINX_DOMAIN_FILENAME_RE.fullmatch(candidate) or candidate in known_domain_tokens:
+            continue
+        actual, resolution = _nginx_resolve_readable_file(root, path)
+        raw = _strip_nginx_comments(_read_text(actual)) if actual is not None else ""
+        config_like = any(token in raw for token in ("server", "listen", "proxy_pass", "root", "include"))
+
+        # A domain-named entry in sites-enabled is useful evidence even when a
+        # Windows mount cannot expose the underlying Linux symlink contents.
+        # For sites-available alone, keep the older conservative requirement that
+        # the target be readable and look like nginx config.
+        if in_available and not in_enabled and not config_like:
+            continue
+        active = _nginx_is_active(path, active_nginx_files)
+        evidence = "Dateiname unter sites-enabled entspricht einer Domain" if in_enabled else "Dateiname unter sites-available entspricht einer Domain"
+        if actual is None:
+            evidence += "; Inhalt/Symlink-Ziel unter Windows nicht lesbar"
+        else:
+            evidence += f"; Auflösung: {resolution}"
+            if config_like:
+                evidence += "; nginx-Konfigurationsinhalt erkannt"
+        rows.append(
+            {
+                "webserver": "Nginx",
+                "domains": candidate,
+                "urls": "",
+                "document_root": "",
+                "application": "",
+                "listen": "",
+                "proxy_pass": "",
+                "fastcgi_pass": "",
+                "access_log": "",
+                "error_log": "",
+                "ssl_certificate": "",
+                "active": "Ja" if active else "Nicht sicher / nur Konfigurationsfund",
+                "source_file": _safe_rel(root, path),
+                "status_hint": (
+                    "Aktiver sites-enabled-Eintrag; Domain aus Dateiname rekonstruiert"
+                    if in_enabled
+                    else "Domain-Hinweis aus VHost-Dateiname; server_name nicht ausgelesen"
+                ),
+                "evidence": evidence,
+            }
+        )
+        known_domain_tokens.add(candidate)
+
+    apache_dirs = [
+        root / "etc/apache2/sites-enabled",
+        root / "etc/apache2/sites-available",
+        root / "etc/httpd/conf.d",
+        root / "var/www/vhosts/system",
+    ]
+    apache_files: list[Path] = []
+    for base in apache_dirs:
+        if not base.is_dir():
+            continue
+        try:
+            for p in base.rglob("*"):
+                if p.is_file() and p.stat().st_size <= MAX_CONFIG_FILE and (
+                    p.suffix == ".conf" or p.name in ("httpd.conf", "apache2.conf")
+                ):
+                    if "vhosts/system" in p.as_posix() and "/conf/" not in p.as_posix():
+                        continue
+                    apache_files.append(p)
+        except OSError:
+            continue
+    for main in (root / "etc/apache2/apache2.conf", root / "etc/httpd/conf/httpd.conf"):
+        if main.is_file():
+            apache_files.append(main)
+
+    for path in sorted(set(apache_files), key=_config_priority):
+        text = _read_text(path)
+        if not text:
+            continue
+        for vh in APACHE_VHOST_RE.finditer(text):
+            endpoint = vh.group(1).strip()
+            block = vh.group(2)
+            names: list[str] = []
+            m = APACHE_NAME_RE.search(block)
+            if m:
+                names.append(m.group(1).strip())
+            for am in APACHE_ALIAS_RE.finditer(block):
+                names.extend(am.group(1).split())
+            rm = APACHE_ROOT_RE.search(block)
+            docroot = rm.group(1).strip() if rm else ""
+            if not names and not docroot:
+                continue
+            domain_text = ", ".join(dict.fromkeys(names)) if names else "(kein ServerName)"
+            key = ("Apache", domain_text, docroot)
+            if key in dedupe:
+                continue
+            dedupe.add(key)
+            rows.append(
+                {
+                    "webserver": "Apache",
+                    "domains": domain_text,
+                    "urls": " | ".join(
+                        f"{'https' if '443' in endpoint else 'http'}://{n}" for n in names if n and not n.startswith("~")
+                    ),
+                    "document_root": docroot,
+                    "application": _app_for_root(root, docroot),
+                    "listen": endpoint,
+                    "proxy_pass": "",
+                    "fastcgi_pass": "",
+                    "access_log": "",
+                    "error_log": "",
+                    "ssl_certificate": "",
+                    "active": "Ja" if "/sites-enabled/" in path.as_posix().casefold() else "Nicht sicher / nur Konfigurationsfund",
+                    "source_file": _safe_rel(root, path),
+                    "status_hint": _website_status(path),
+                    "evidence": "VirtualHost in Apache-Konfiguration",
+                }
+            )
+
+    # Application markers can reveal sites that are not represented by enabled vhost configs.
+    search_roots = [root / "var/www", root / "srv/www", root / "opt"]
+    marker_count = 0
+    for base in search_roots:
+        if not base.is_dir() or marker_count >= MAX_APP_MARKERS:
+            continue
+        try:
+            for marker in base.rglob("wp-config.php"):
+                if marker_count >= MAX_APP_MARKERS:
+                    break
+                marker_count += 1
+                docroot_host = marker.parent
+                docroot = "/" + docroot_host.relative_to(root).as_posix()
+                if not any(r["document_root"] == docroot for r in rows):
+                    rows.append(
+                        {
+                            "webserver": "(nicht aus Konfiguration zugeordnet)",
+                            "domains": "(nicht ermittelt)",
+                            "urls": "",
+                            "document_root": docroot,
+                            "application": "WordPress",
+                            "listen": "",
+                            "proxy_pass": "",
+                            "fastcgi_pass": "",
+                            "access_log": "",
+                            "error_log": "",
+                            "ssl_certificate": "",
+                            "active": "Nicht aus VHost-Konfiguration ableitbar",
+                            "source_file": _safe_rel(root, marker),
+                            "status_hint": "Webanwendung im Dateisystem gefunden",
+                            "evidence": "wp-config.php gefunden",
+                        }
+                    )
+            for marker in base.rglob("occ"):
+                if marker_count >= MAX_APP_MARKERS:
+                    break
+                if not marker.is_file() or not (marker.parent / "config" / "config.php").is_file():
+                    continue
+                marker_count += 1
+                docroot_host = marker.parent
+                docroot = "/" + docroot_host.relative_to(root).as_posix()
+                if not any(r["document_root"] == docroot and r["application"] == "Nextcloud" for r in rows):
+                    rows.append(
+                        {
+                            "webserver": "(nicht aus Konfiguration zugeordnet)",
+                            "domains": "(nicht ermittelt)",
+                            "urls": "",
+                            "document_root": docroot,
+                            "application": "Nextcloud",
+                            "listen": "",
+                            "proxy_pass": "",
+                            "fastcgi_pass": "",
+                            "access_log": "",
+                            "error_log": "",
+                            "ssl_certificate": "",
+                            "active": "Nicht aus VHost-Konfiguration ableitbar",
+                            "source_file": _safe_rel(root, marker.parent / "config" / "config.php"),
+                            "status_hint": "Webanwendung im Dateisystem gefunden",
+                            "evidence": "Nextcloud occ + config/config.php gefunden",
+                        }
+                    )
+        except (OSError, PermissionError):
+            continue
+
+    # Plesk directory structure is itself useful when configs are missing/rotated.
+    plesk_system = root / "var/www/vhosts/system"
+    if plesk_system.is_dir():
+        try:
+            for d in plesk_system.iterdir():
+                if not d.is_dir():
+                    continue
+                domain = d.name
+                if not any(domain in r.get("domains", "").split(", ") for r in rows):
+                    rows.append(
+                        {
+                            "webserver": "Plesk-VHost",
+                            "domains": domain,
+                            "urls": "",
+                            "document_root": f"/var/www/vhosts/{domain}/httpdocs",
+                            "application": _app_for_root(root, f"/var/www/vhosts/{domain}/httpdocs"),
+                            "listen": "",
+                            "proxy_pass": "",
+                            "fastcgi_pass": "",
+                            "access_log": "",
+                            "error_log": "",
+                            "ssl_certificate": "",
+                            "active": "Plesk-VHost-Struktur vorhanden",
+                            "source_file": _safe_rel(root, d),
+                            "status_hint": "Plesk-VHost-Struktur vorhanden",
+                            "evidence": "Plesk vhost system directory",
+                        }
+                    )
         except OSError:
             pass
 
-    return [asdict(x) for x in out]
+    rows.sort(key=lambda r: (r.get("domains", ""), r.get("webserver", ""), r.get("document_root", "")))
+    return rows
 
 
-def collect_ip_summary(ssh: list[dict], admins: list[dict], mail_access: list[dict]) -> list[dict]:
-    rows: dict[str, dict] = {}
-    def get(ip: str) -> dict:
-        return rows.setdefault(ip, {"ip": ip, "ssh": 0, "admin": 0, "imap_pop": 0, "smtp_auth": 0, "first": "", "last": ""})
-    def touch(row: dict, ts: str) -> None:
-        if not ts:
-            return
-        if not row["first"] or ts < row["first"]:
-            row["first"] = ts
-        if not row["last"] or ts > row["last"]:
-            row["last"] = ts
-    for x in ssh:
-        row = get(x.get("ip", "")); row["ssh"] += 1; touch(row, x.get("timestamp", ""))
-    for x in admins:
-        row = get(x.get("ip", "")); row["admin"] += 1; touch(row, x.get("timestamp", ""))
-    for x in mail_access:
-        row = get(x.get("ip", ""));
-        if x.get("protocol") in {"IMAP", "POP3"}: row["imap_pop"] += 1
-        if x.get("protocol") == "SMTP AUTH": row["smtp_auth"] += 1
-        touch(row, x.get("timestamp", ""))
-    return sorted((v for k, v in rows.items() if k), key=lambda x: (-(x["ssh"] + x["admin"] + x["imap_pop"] + x["smtp_auth"]), x["ip"]))
+SERVICE_SIGNATURES = [
+    ("Remote Access", "OpenSSH", ("sshd", "ssh.service"), ("etc/ssh/sshd_config",)),
+    ("Web", "Nginx", ("nginx",), ("etc/nginx/nginx.conf",)),
+    ("Web", "Apache HTTP Server", ("apache2", "httpd"), ("etc/apache2", "etc/httpd")),
+    ("Web", "PHP-FPM", ("php-fpm", "php8", "php7"), ("etc/php",)),
+    ("Hosting/Admin", "Plesk", ("psa", "sw-cp-server", "plesk"), ("etc/psa", "opt/psa", "usr/local/psa", "etc/sw-cp-server")),
+    ("Mail", "Postfix", ("postfix",), ("etc/postfix/main.cf",)),
+    ("Mail", "Exim", ("exim4", "exim"), ("etc/exim4", "etc/exim")),
+    ("Mail", "Dovecot", ("dovecot",), ("etc/dovecot",)),
+    ("Mail", "Rspamd", ("rspamd",), ("etc/rspamd",)),
+    ("Mail", "SpamAssassin", ("spamassassin", "spamd"), ("etc/spamassassin",)),
+    ("Voice", "TeamSpeak", ("teamspeak", "ts3server"), ("etc/teamspeak3-server", "opt/teamspeak", "home/teamspeak")),
+    ("Cloud", "Nextcloud", ("nextcloud",), ("var/www/nextcloud/config/config.php", "var/www/html/nextcloud/config/config.php")),
+    ("Container", "Docker", ("docker", "containerd"), ("etc/docker", "var/lib/docker")),
+    ("Container", "Podman", ("podman",), ("etc/containers", "var/lib/containers")),
+    ("Datenbank", "MariaDB/MySQL", ("mariadb", "mysql", "mysqld"), ("etc/mysql", "var/lib/mysql")),
+    ("Datenbank", "PostgreSQL", ("postgresql", "postgres"), ("etc/postgresql", "var/lib/postgresql")),
+    ("Datenbank", "Redis", ("redis",), ("etc/redis", "var/lib/redis")),
+    ("Dateitransfer", "vsftpd", ("vsftpd",), ("etc/vsftpd.conf",)),
+    ("Dateitransfer", "ProFTPD", ("proftpd",), ("etc/proftpd",)),
+    ("Sicherheit", "Fail2ban", ("fail2ban",), ("etc/fail2ban",)),
+    ("VPN", "WireGuard", ("wg-quick", "wireguard"), ("etc/wireguard",)),
+    ("VPN", "OpenVPN", ("openvpn",), ("etc/openvpn",)),
+]
+
+
+def _event_service_text(event: dict[str, Any]) -> str:
+    return " ".join(
+        str(event.get(k, "")) for k in ("service", "unit", "message")
+    ).casefold()
+
+
+def scan_services(root: Path, events: list[dict[str, Any]], websites: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    event_texts = [(_event_service_text(e), e.get("time_utc", "")) for e in events]
+    rows: list[dict[str, Any]] = []
+
+    for category, label, event_keys, fs_markers in SERVICE_SIGNATURES:
+        matched_times: list[str] = []
+        for text, ts in event_texts:
+            if any(key.casefold() in text for key in event_keys):
+                if ts:
+                    matched_times.append(ts)
+                else:
+                    matched_times.append("")
+
+        fs_hits = []
+        for rel in fs_markers:
+            p = root / rel
+            if p.exists():
+                fs_hits.append("/" + rel.replace("\\", "/"))
+
+        # App detection from website scan may identify Nextcloud outside standard paths.
+        if label == "Nextcloud":
+            for site in websites:
+                if site.get("application") == "Nextcloud":
+                    fs_hits.append(site.get("document_root", "") + "/config/config.php")
+
+        if not matched_times and not fs_hits:
+            continue
+
+        if matched_times and fs_hits:
+            assessment = "Journal-Aktivität + Installation/Konfiguration nachgewiesen"
+        elif matched_times:
+            assessment = "Aktivität im Journal festgestellt"
+        else:
+            assessment = "Installation/Konfiguration im Dateisystem festgestellt"
+        clean_times = sorted(t for t in matched_times if t)
+        rows.append(
+            {
+                "category": category,
+                "service": label,
+                "assessment": assessment,
+                "journal_count": len(matched_times),
+                "first_seen": clean_times[0] if clean_times else "",
+                "last_seen": clean_times[-1] if clean_times else "",
+                "evidence": "; ".join(dict.fromkeys(fs_hits)) if fs_hits else "Journal-Einträge",
+            }
+        )
+
+    # Include distinct active-looking systemd services even if not in curated signatures.
+    unit_counter: Counter[str] = Counter()
+    first_last: dict[str, list[str]] = defaultdict(list)
+    for event in events:
+        unit = str(event.get("unit", ""))
+        if unit.endswith(".service"):
+            unit_counter[unit] += 1
+            if event.get("time_utc"):
+                first_last[unit].append(event["time_utc"])
+    known_text = " ".join(r["service"].casefold() for r in rows)
+    for unit, count in unit_counter.most_common(75):
+        stem = unit.removesuffix(".service")
+        if stem.casefold() in known_text or count < 2:
+            continue
+        times = sorted(first_last.get(unit, []))
+        rows.append(
+            {
+                "category": "Weitere systemd-Dienste",
+                "service": unit,
+                "assessment": "Aktivität im Journal festgestellt",
+                "journal_count": count,
+                "first_seen": times[0] if times else "",
+                "last_seen": times[-1] if times else "",
+                "evidence": "_SYSTEMD_UNIT im Journal",
+            }
+        )
+
+    rows.sort(key=lambda r: (r["category"], r["service"]))
+    return rows
+
+
+def discover_access_logs(root: Path) -> list[Path]:
+    candidates: list[Path] = []
+    bases = [
+        root / "var/log/nginx",
+        root / "var/log/apache2",
+        root / "var/log/httpd",
+        root / "var/log/plesk",
+        root / "var/log/sw-cp-server",
+        root / "usr/local/psa/admin/logs",
+        root / "opt/psa/admin/logs",
+        root / "var/www/vhosts/system",
+    ]
+    for base in bases:
+        if not base.is_dir():
+            continue
+        try:
+            for p in base.rglob("*"):
+                if len(candidates) >= MAX_ACCESS_LOGS:
+                    break
+                if not p.is_file():
+                    continue
+                name = p.name.casefold()
+                posix = p.as_posix().casefold()
+                is_access = (
+                    "access" in name
+                    or "httpsd_access_log" in name
+                    or ("plesk" in posix and name == "panel.log")
+                )
+                if is_access and (p.suffix.casefold() in ("", ".log", ".gz") or ".log." in name or "access_log" in name):
+                    candidates.append(p)
+        except (OSError, PermissionError):
+            continue
+    return sorted(set(candidates), key=str)[:MAX_ACCESS_LOGS]
+
+
+def _parse_access_time(value: str) -> str:
+    for fmt in ("%d/%b/%Y:%H:%M:%S %z", "%d/%b/%Y:%H:%M:%S"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        except ValueError:
+            pass
+    return value
+
+
+def _host_hint_from_log(root: Path, path: Path) -> str:
+    parts = path.parts
+    try:
+        idx = parts.index("system")
+        if idx > 0 and "vhosts" in parts[:idx]:
+            return parts[idx + 1] if idx + 1 < len(parts) else ""
+    except ValueError:
+        pass
+    # Windows paths preserve case; use a case-insensitive fallback.
+    lower = [p.casefold() for p in parts]
+    if "vhosts" in lower and "system" in lower:
+        idx = lower.index("system")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return ""
+
+
+def _tool_from_request(
+    source: Path,
+    request_path: str,
+    known_apps: set[str],
+    host_hint: str,
+    nextcloud_domains: set[str],
+) -> str:
+    src = source.as_posix().casefold()
+    p = request_path.casefold()
+    if "plesk" in src or "sw-cp-server" in src or "psa/admin/logs" in src or "/login_up.php3" in p:
+        return "Plesk"
+    if WORDPRESS_PATH_RE.search(request_path):
+        return "WordPress"
+    if PHPMYADMIN_PATH_RE.search(request_path):
+        return "phpMyAdmin"
+    if "Nextcloud" in known_apps and NEXTCLOUD_PATH_RE.search(request_path):
+        # Generic /login paths are ambiguous on shared access logs. Only classify as
+        # Nextcloud if the URL itself contains Nextcloud, the log is site-specific,
+        # or the source path points to Nextcloud material.
+        if "nextcloud" in p or "nextcloud" in src or (host_hint and host_hint.casefold() in nextcloud_domains):
+            return "Nextcloud"
+    if GENERIC_ADMIN_PATH_RE.search(request_path):
+        return "Generisches Admin-Panel"
+    return ""
+
+
+def _basic_http_assessment(method: str, path: str, status: int, tool: str) -> tuple[str, str]:
+    if status in (401, 403):
+        return "Zugriff abgewiesen", "hoch"
+    if status == 404:
+        return "Admin-Pfad nicht vorhanden (404)", "hoch"
+    if status >= 500:
+        return "Serverfehler beim Zugriff", "hoch"
+    if tool == "WordPress" and "wp-login.php" in path.casefold():
+        if method == "POST" and status in (301, 302, 303, 307, 308):
+            return "Login-POST mit Weiterleitung; Erfolg noch zu korrelieren", "mittel"
+        if method == "POST" and status == 200:
+            return "Login-POST ohne Erfolgsnachweis", "mittel"
+        return "Loginseite aufgerufen; keine Anmeldung nachgewiesen", "hoch"
+    if tool in ("Nextcloud", "phpMyAdmin", "Plesk") and method == "POST":
+        if status in (301, 302, 303, 307, 308):
+            return "Login-/Admin-POST mit Weiterleitung; möglicher Erfolg", "mittel"
+        if 200 <= status < 300:
+            return "Login-/Admin-POST beantwortet; Authentifizierung nicht allein nachweisbar", "mittel"
+    if 200 <= status < 300:
+        return "Admin-Endpunkt erfolgreich ausgeliefert; Login nicht allein nachweisbar", "hoch"
+    if 300 <= status < 400:
+        return "Weiterleitung; Authentifizierung nicht allein ableitbar", "hoch"
+    return f"HTTP-Status {status}", "hoch"
+
+
+def _open_log(path: Path):
+    if path.suffix.casefold() == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return path.open("rt", encoding="utf-8", errors="replace")
+
+
+def scan_admin_access(root: Path, websites: list[dict[str, Any]], ssh_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    access_logs = discover_access_logs(root)
+    known_apps = {r.get("application", "") for r in websites if r.get("application")}
+    nextcloud_domains: set[str] = set()
+    for site in websites:
+        if site.get("application") != "Nextcloud":
+            continue
+        for domain in str(site.get("domains", "")).split(","):
+            domain = domain.strip().casefold()
+            if domain and not domain.startswith("("):
+                nextcloud_domains.add(domain)
+    ssh_success_ips = {
+        r.get("ip", "") for r in ssh_rows if r.get("type") == SSH_SUCCESS_TEXT and r.get("ip")
+    }
+    log_site_map: dict[str, str] = {}
+    for site in websites:
+        domains = str(site.get("domains", "")).strip()
+        if not domains or domains.startswith("("):
+            continue
+        for spec in str(site.get("access_log", "")).split("|"):
+            token = spec.strip().split()[0] if spec.strip() else ""
+            if token.startswith("/"):
+                log_site_map[token.casefold()] = domains
+    rows: list[dict[str, Any]] = []
+
+    for path in access_logs:
+        host_hint = _host_hint_from_log(root, path)
+        if not host_hint:
+            host_hint = log_site_map.get(_safe_rel(root, path).casefold(), "")
+        try:
+            with _open_log(path) as handle:
+                line_no = 0
+                while line_no < MAX_ACCESS_LINES_PER_FILE and len(rows) < MAX_ADMIN_FINDINGS:
+                    line = handle.readline(MAX_ACCESS_LINE_LENGTH)
+                    if not line:
+                        break
+                    line_no += 1
+                    # An overlong line is treated as malformed and skipped. Consume its remainder.
+                    if len(line) >= MAX_ACCESS_LINE_LENGTH and not line.endswith("\n"):
+                        while True:
+                            tail = handle.readline(MAX_ACCESS_LINE_LENGTH)
+                            if not tail or tail.endswith("\n"):
+                                break
+                        continue
+                    match = ACCESS_RE.match(line.rstrip("\n"))
+                    if not match:
+                        continue
+                    gd = match.groupdict()
+                    ip = gd["ip"].strip("[]")
+                    try:
+                        ipaddress.ip_address(ip)
+                    except ValueError:
+                        continue
+                    request_path = gd["path"]
+                    tool = _tool_from_request(path, request_path, known_apps, host_hint, nextcloud_domains)
+                    if not tool:
+                        continue
+                    status = int(gd["status"])
+                    assessment, confidence = _basic_http_assessment(gd["method"], request_path, status, tool)
+                    rows.append(
+                        {
+                            "time_utc": _parse_access_time(gd["time"]),
+                            "tool": tool,
+                            "assessment": assessment,
+                            "confidence": confidence,
+                            "ip": ip,
+                            "ssh_correlation": "Ja - gleiche IP mit erfolgreicher SSH-Anmeldung" if ip in ssh_success_ips else "",
+                            "method": gd["method"],
+                            "path": request_path,
+                            "status": status,
+                            "site": host_hint,
+                            "user_agent": gd.get("ua") or "",
+                            "source_file": _safe_rel(root, path),
+                            "line": line_no,
+                        }
+                    )
+        except (OSError, EOFError, gzip.BadGzipFile):
+            continue
+
+    # Correlate login redirect -> protected admin page from same IP shortly afterwards.
+    rows.sort(key=lambda r: r.get("time_utc", ""))
+    parsed_dt: list[datetime | None] = []
+    for row in rows:
+        try:
+            parsed_dt.append(datetime.fromisoformat(str(row["time_utc"]).replace("Z", "+00:00")))
+        except ValueError:
+            parsed_dt.append(None)
+
+    for i, row in enumerate(rows):
+        if row["tool"] not in ("WordPress", "Nextcloud", "phpMyAdmin", "Plesk"):
+            continue
+        if row["method"] != "POST" or row["status"] not in (301, 302, 303, 307, 308):
+            continue
+        start_dt = parsed_dt[i]
+        if start_dt is None:
+            continue
+        for j in range(i + 1, min(i + 200, len(rows))):
+            candidate = rows[j]
+            cdt = parsed_dt[j]
+            if cdt is None or cdt - start_dt > timedelta(minutes=10):
+                break
+            if candidate["ip"] != row["ip"] or candidate["tool"] != row["tool"]:
+                continue
+            cp = candidate["path"].casefold()
+            protected = False
+            if row["tool"] == "WordPress":
+                protected = "/wp-admin" in cp and "admin-ajax.php" not in cp and 200 <= candidate["status"] < 300
+            elif row["tool"] == "Nextcloud":
+                protected = ("/settings" in cp or "/apps/" in cp) and 200 <= candidate["status"] < 300
+            elif row["tool"] == "phpMyAdmin":
+                protected = 200 <= candidate["status"] < 300 and not ("login" in cp)
+            elif row["tool"] == "Plesk":
+                protected = 200 <= candidate["status"] < 300 and "login" not in cp
+            if protected:
+                row["assessment"] = f"Starker Hinweis auf erfolgreiche {row['tool']}-Anmeldung (POST/Redirect + anschließender Adminzugriff)"
+                row["confidence"] = "hoch"
+                candidate["assessment"] = f"Geschützter Bereich nach {row['tool']}-Login von gleicher IP erreicht"
+                candidate["confidence"] = "hoch"
+                break
+
+    rows.sort(key=lambda r: r.get("time_utc", ""), reverse=True)
+    return rows, [_safe_rel(root, p) for p in access_logs]
+
+
+def scan_server_root(
+    root: Path,
+    events: list[dict[str, Any]],
+    ssh_rows: list[dict[str, Any]],
+    progress: Callable[[str], None] | None = None,
+) -> ServerScanResult:
+    result = ServerScanResult(linux_root=str(root))
+    if progress:
+        progress("Ermittle Webseiten und Webanwendungen …")
+    result.websites = scan_websites(root)
+    nginx_rows = [r for r in result.websites if r.get("webserver") == "Nginx"]
+    nginx_diag = _nginx_sites_diagnostics(root)
+    if nginx_rows:
+        active_nginx = sum(1 for r in nginx_rows if r.get("active") == "Ja")
+        result.scan_notes.append(
+            f"NGINX-Inventar: {len(nginx_rows)} VHost-/server_name-Feststellungen, davon {active_nginx} als aktiv eingebunden erkannt. "
+            "Zusätzlich zu nginx.conf/Includes wurden sites-available, sites-enabled und weitere Dateien unter /etc/nginx inventarisiert."
+        )
+    if nginx_diag.get("enabled_total") or nginx_diag.get("available_total"):
+        enabled_res = ", ".join(
+            f"{count}× {method}" for method, count in nginx_diag["enabled_resolution"].most_common()
+        ) or "keine"
+        available_res = ", ".join(
+            f"{count}× {method}" for method, count in nginx_diag["available_resolution"].most_common()
+        ) or "keine"
+        result.scan_notes.append(
+            f"NGINX-Verzeichnisdiagnose: sites-enabled={nginx_diag['enabled_total']} Einträge ({enabled_res}); "
+            f"sites-available={nginx_diag['available_total']} Einträge ({available_res})."
+        )
+        unreadable = nginx_diag["enabled_resolution"].get("nicht lesbar", 0)
+        if unreadable:
+            names = ", ".join(nginx_diag.get("enabled_names", [])[:20])
+            result.scan_notes.append(
+                f"Hinweis: {unreadable} Einträge in sites-enabled konnten vom Windows-Dateisystem nicht direkt aufgelöst werden. "
+                "Der Analyzer versucht deshalb die gleichnamige Datei in sites-available und domainartige Dateinamen als Rückfallebene zu verwenden."
+                + (f" Sichtbare Eintragsnamen (Auszug): {names}." if names else "")
+            )
+    if progress:
+        progress("Ermittle installierte/aktive Dienste …")
+    result.services = scan_services(root, events, result.websites)
+    if progress:
+        progress("Prüfe Webserver-/Panel-Access-Logs auf Adminzugriffe …")
+    result.admin_accesses, result.access_log_files = scan_admin_access(root, result.websites, ssh_rows)
+    if progress:
+        progress("Analysiere Mailserver, Konten, Aliase und authentifizierte Mailzugriffe …")
+    mail_scan = scan_mail(root, events)
+    result.mail_servers = mail_scan.servers
+    result.mail_accounts = mail_scan.accounts
+    result.mail_aliases = mail_scan.aliases
+    result.mail_accesses = mail_scan.accesses
+    result.mail_diagnostics = mail_scan.diagnostics
+    result.mail_log_files = mail_scan.log_files
+    result.scan_notes.extend(mail_scan.notes)
+    if progress:
+        progress("Analysiere TLS-/Let's-Encrypt-Zertifikate …")
+    result.tls_certificates = scan_tls_certificates(root)
+    if progress:
+        progress("Analysiere Betreiber-Artefakte (SSH-Keys, Git, Shell-History, Cron) …")
+    result.operator_artifacts, artifact_notes = scan_operator_artifacts(root)
+    result.scan_notes.extend(artifact_notes)
+    if len(result.admin_accesses) >= MAX_ADMIN_FINDINGS:
+        result.scan_notes.append(
+            f"Adminzugriffs-Auswertung aus Sicherheits-/Performancegründen auf {MAX_ADMIN_FINDINGS:,} Treffer begrenzt.".replace(",", ".")
+        )
+    if not result.access_log_files:
+        result.scan_notes.append("Keine typischen Webserver-/Plesk-Access-Logs im ausgewählten Linux-Root gefunden.")
+    if not result.websites:
+        result.scan_notes.append("Keine Website/VHost-Konfiguration oder bekannte Webanwendung erkannt.")
+    return result

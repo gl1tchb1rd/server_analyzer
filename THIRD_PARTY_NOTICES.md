@@ -1,37 +1,25 @@
-# Third-Party Notices
+# Third-party notices
 
-Server Analyzer ist selbst unter **GNU GPL-3.0-or-later** veröffentlicht.
+Forensic Server Analyzer creates a local Python virtual environment on first run and may install the packages listed in `_system/requirements.txt`. These packages are independent third-party software and remain under their own licenses.
 
-Beim ersten Start kann der Starter die folgenden Open-Source-Pakete über `pip` in eine lokale `_runtime`-Umgebung nachladen. Diese Pakete sind **nicht Bestandteil des eigenen Server-Analyzer-Codes** und unterliegen ihren jeweiligen eigenen Lizenzbedingungen. Maßgeblich sind stets die Lizenz- und Copyrightdateien der konkret installierten Version.
+## Runtime dependencies
 
-| Komponente | Zweck | Lizenz |
+| Component | Purpose | License / licensing model |
 |---|---|---|
-| PySide6 / Qt for Python | Grafische Oberfläche | Qt Community: insbesondere LGPL-3.0/GPL-2.0/GPL-3.0; alternativ kommerzielle Qt-Lizenz |
-| Shiboken6 / PySide6 Essentials/Addons | PySide6-Laufzeitkomponenten | Qt-for-Python-/Qt-Lizenzbedingungen |
-| lz4 | Dekompression LZ4-komprimierter Journal-Daten | BSD-3-Clause |
-| zstandard | Dekompression ZSTD-komprimierter Journal-Daten | BSD-3-Clause |
-| ReportLab | PDF-Auswertungsberichte | BSD-Lizenz |
-| cryptography | X.509-/TLS-Zertifikatsanalyse | Apache-2.0 OR BSD-3-Clause |
+| PySide6 / Qt for Python | GUI / Qt bindings | Qt open-source distribution: GNU LGPL v3 and/or GNU GPL v3 depending on component; commercial Qt licensing is also available |
+| Shiboken6 / PySide6_Essentials / PySide6_Addons | Dependencies installed with PySide6 | Qt for Python / Qt licensing applies to the respective components |
+| lz4 | LZ4 journal decompression | BSD 3-Clause |
+| zstandard | Zstandard journal decompression | BSD 3-Clause |
+| ReportLab | PDF report generation | BSD License |
 
-Offizielle Lizenzinformationen:
+## Optional build dependency
 
-- Qt for Python / PySide6: https://doc.qt.io/qtforpython-6/
-- Qt for Python – Third-party licenses: https://doc.qt.io/qtforpython-6/licenses.html
-- lz4: https://pypi.org/project/lz4/
-- zstandard: https://pypi.org/project/zstandard/
-- ReportLab: https://docs.reportlab.com/developerfaqs/
-- cryptography: https://pypi.org/project/cryptography/
+| Component | Purpose | License |
+|---|---|---|
+| PyInstaller | Optional creation of a portable Windows build | GPL-2.0-or-later with PyInstaller's special exception for generated bundles; some files are Apache-2.0 |
 
-## systemd Journal-Dateiformat
+The standard source ZIP does **not** bundle these third-party Python packages. They are installed locally by `pip` when required. The exact copyright notices and license files supplied by the installed package versions remain authoritative and are included in/alongside those installed distributions where provided by their authors.
 
-Der native Windows-Journalparser implementiert das öffentlich dokumentierte binäre systemd-Journalformat eigenständig. systemd-Code oder `libsystemd` werden nicht mitgeliefert oder gelinkt. Die Formatdokumentation von systemd steht unter LGPL-2.1-or-later; systemd selbst ist nicht Bestandteil dieser Distribution.
+Qt/LGPL text is additionally provided under `_system/licenses/LGPL-3.0.txt` for convenience. This notice does not replace the license files distributed by the respective third-party projects.
 
-## Nachgeladene Pakete
-
-Die Standarddistribution dieses Projekts enthält keine Kopie der oben genannten Python-Pakete. Der Starter installiert sie – sofern erforderlich und zulässig – aus der konfigurierten `pip`-Paketquelle in die lokale `_runtime`-Umgebung.
-
-## Offline-Wheels / Binärdistribution
-
-Werden später Wheels, Qt-Bibliotheken oder eine portable/gebündelte Binärdistribution zusammen mit Server Analyzer weitergegeben, müssen zusätzlich die für **genau diese mitgelieferten Versionen** geltenden Lizenztexte, Copyright- und Notice-Dateien der jeweiligen Pakete mit der Distribution erhalten bleiben.
-
-Diese Datei ist eine technische Lizenzübersicht und keine Rechtsberatung.
+Project source: https://github.com/gl1tchb1rd/server_analyzer

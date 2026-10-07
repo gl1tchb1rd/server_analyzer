@@ -1,0 +1,12 @@
+Forensic Server Analyzer 0.6.0 - technical rollback integrity
+
+The following functional files were copied byte-for-byte from the supplied 0.4.3 build:
+
+5901aabee950a473e8a6abc06fe2a0a71b25cac19677f89c5fbb7b6af0402ec3  _system/journal_native.py
+1fb0acb3921ae65b1968ed4388108fc6bf7ded24f226a7f7bc4683393ccf5b82  _system/server_forensics.py
+983ca4aed7a49419091f2550ba8d8e4229cc397e61601ed0a30b98863cc5eac2  _system/mail_forensics.py
+787b3beb1a33674024ad965988e1bd93a58c73c427201da0b3e29735e06fba76  _system/tls_forensics.py
+81b4d34ed72737e143f2cf3a66f1f265cb9eb4bb481c6d6e404cffce30cfb9b6  _system/operator_artifacts.py
+54fbdbe0473634409d6f2b2ef8f3205b92ecb272cd9f734f20631d4bc616ab1a  _system/requirements.txt
+
+Changed intentionally: starter branding/version, GUI identity/About/version, PDF visible identity/project source, build helper branding, documentation and license/disclaimer files.

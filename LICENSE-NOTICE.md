@@ -1,13 +1,10 @@
-# Lizenz des Projekts
+# License notice
 
-**Server Analyzer**
+Forensic Server Analyzer is licensed under the **GNU General Public License v3 or later (GPL-3.0-or-later)**.
 
 Copyright (C) 2026 Gl1tchb1rd
 
-Projektquelle: https://github.com/gl1tchb1rd/server_analyzer
+Project source: https://github.com/gl1tchb1rd/server_analyzer
 
-Dieses Projekt ist freie Software und wird unter **GNU General Public License Version 3 oder – nach Ihrer Wahl – jeder späteren Version (GPL-3.0-or-later)** veröffentlicht.
-
-Der vollständige Text der GNU GPL Version 3 befindet sich in der Datei `LICENSE`.
-
-Drittanbieter-Komponenten sind nicht automatisch unter der GPL des Projekts lizenziert. Ihre jeweiligen Lizenzbedingungen sind in `THIRD_PARTY_NOTICES.md` dokumentiert.
+The complete GPLv3 text is provided in `LICENSE` and `_system/licenses/GPL-3.0.txt`.
+Third-party Python packages are not part of the application's own license and remain subject to their respective licenses. See `THIRD_PARTY_NOTICES.md`.
