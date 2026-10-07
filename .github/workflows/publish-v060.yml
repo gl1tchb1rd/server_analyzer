@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "release/Forensic_Server_Analyzer_v0.6.0_Windows.zip"
+      - "release/Forensic_Server_Analyzer_v0.6.0_Windows.zip.b64"
 
 permissions:
   contents: write
@@ -16,19 +16,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Reconstruct and verify release
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode release/Forensic_Server_Analyzer_v0.6.0_Windows.zip.b64 > /tmp/fsa060.zip
+          echo "ffe90c77017c02dd6e5a48d4ed48cee69c7362ca668d1971203db462ccdaa899  /tmp/fsa060.zip" | sha256sum --check -
+
       - name: Extract verified release source
         shell: bash
         run: |
           set -euo pipefail
           rm -rf /tmp/fsa060
           mkdir -p /tmp/fsa060
-          unzip -q release/Forensic_Server_Analyzer_v0.6.0_Windows.zip -d /tmp/fsa060
+          unzip -q /tmp/fsa060.zip -d /tmp/fsa060
           SRC="$(find /tmp/fsa060 -mindepth 1 -maxdepth 1 -type d | head -n 1)"
           test -n "$SRC"
           test -f "$SRC/Forensic_Server_Analyzer.py"
           test -f "$SRC/_system/journal_native.py"
+          grep -q "Forensic Server Analyzer" "$SRC/_system/app.py"
+          grep -q "0.6.0" "$SRC/_system/app.py"
 
-          rsync -a --delete             --exclude=".git/"             --exclude=".github/"             --exclude="release/"             "$SRC/" ./
+          rsync -a --delete \
+            --exclude=".git/" \
+            --exclude=".github/" \
+            --exclude="release/" \
+            "$SRC/" ./
 
       - name: Commit v0.6.0 source tree
         shell: bash
