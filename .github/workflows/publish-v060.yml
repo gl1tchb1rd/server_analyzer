@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "release/Forensic_Server_Analyzer_v0.6.0_Windows.zip.b64"
+      - "release/fsa060.ready"
 
 permissions:
   contents: write
@@ -20,7 +20,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base64 --decode release/Forensic_Server_Analyzer_v0.6.0_Windows.zip.b64 > /tmp/fsa060.zip
+          cat release/fsa060.part-* > /tmp/fsa060.b64
+          base64 --decode /tmp/fsa060.b64 > /tmp/fsa060.zip
           echo "ffe90c77017c02dd6e5a48d4ed48cee69c7362ca668d1971203db462ccdaa899  /tmp/fsa060.zip" | sha256sum --check -
 
       - name: Extract verified release source
